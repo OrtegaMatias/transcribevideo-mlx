@@ -13,12 +13,21 @@ encendido para el informe final, que sí es una tarea de síntesis.
 """
 from __future__ import annotations
 
+import gc
 import json
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Callable
 
-DEFAULT_MODEL = "lmstudio-community/Qwen3.8-27B-MLX-4bit"
+#: Modelo de la etapa de lectura, la que se repite una vez por pantalla. Se
+#: elige por velocidad: medido sobre las mismas pantallas, el MoE de gemma
+#: (128 expertos, 8 activos) resuelve una pantalla en 3.2s contra 14.7s del
+#: Qwen denso, con fidelidad idéntica en el cuerpo de la pantalla.
+DEFAULT_MODEL = "lmstudio-community/gemma-4-26B-A4B-it-QAT-MLX-4bit"
+#: Modelo del informe final. Es UNA sola llamada, y es la única etapa de
+#: síntesis de la corrida, así que aquí conviene el modelo más capaz aunque sea
+#: más lento: pagar dos minutos una vez, en vez de once segundos cuarenta veces.
+DEFAULT_REPORTER = "lmstudio-community/Qwen3.8-27B-MLX-4bit"
 #: Techo de generación por pantalla. Un chunk típico ronda los 400 tokens; el
 #: margen cubre pantallas con mucho texto sin dejar que una repetición se
 #: descontrole.
@@ -84,6 +93,22 @@ class VisionModel:
             raise ModelError(
                 f"No se pudo cargar el modelo '{model}'.\n{exc}") from exc
         self.name = model
+
+    def release(self) -> None:
+        """Suelta los pesos para que quepa otro modelo.
+
+        Los dos modelos suman ~32 GB y cada uno tiene un pico medido de 18-21 GB,
+        así que no caben a la vez en 48 GB de memoria unificada. Cargarlos en
+        secuencia cuesta unos segundos y evita quedarse sin memoria justo al
+        final, con todo el trabajo caro ya hecho.
+        """
+        self._model = self._processor = self._config = None
+        gc.collect()
+        try:
+            import mlx.core as mx
+            mx.clear_cache()
+        except Exception:  # noqa: BLE001 - liberar es best-effort
+            pass
 
     def analyze_screen(self, system: str, user: str, images: list[Path],
                        on_delta: Callable[[str], None] | None = None
@@ -161,17 +186,23 @@ class VisionModel:
         return Generation(text=_strip_reasoning("".join(pieces)), usage=usage)
 
 
-def _strip_reasoning(text: str) -> str:
-    """Descarta el bloque de razonamiento.
+#: Cada familia cierra su canal de razonamiento a su manera. Qwen usa
+#: `</think>`; gemma abre `<|channel>thought` y cierra con `<channel|>`, con la
+#: barra al otro lado. Conocer solo una deja que el razonamiento crudo — y en su
+#: idioma de entrenamiento — se cuele entero al informe.
+REASONING_CLOSERS = ("</think>", "<channel|>")
 
-    Con `enable_thinking=False` la plantilla ya deja `<think></think>` cerrado y
-    la salida viene limpia; con razonamiento activo el texto útil empieza
-    después del `</think>` final.
+
+def _strip_reasoning(text: str) -> str:
+    """Descarta el bloque de razonamiento, sea cual sea el modelo.
+
+    Con `enable_thinking=False` la plantilla deja el canal ya cerrado y la
+    salida viene limpia; con razonamiento activo el texto útil empieza después
+    del último cierre.
     """
-    marker = "</think>"
-    if marker in text:
-        text = text.rsplit(marker, 1)[1]
-    return text.strip()
+    cut = max((text.rfind(marker) + len(marker) for marker in REASONING_CLOSERS
+               if marker in text), default=0)
+    return text[cut:].strip()
 
 
 def _extract_json(text: str) -> dict:

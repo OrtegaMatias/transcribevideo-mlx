@@ -77,7 +77,7 @@ def render_markdown(video: Path, body: str, units: list[Unit],
 
 
 def render_json(video: Path, units: list[Unit], transcript: Transcript,
-                duration: float, elapsed: float, model_name: str,
+                duration: float, elapsed: float, model_name: dict | str,
                 report_body: str, usage: Usage | None = None) -> str:
     """Todo lo intermedio, para regenerar el informe sin reprocesar el video."""
     payload = {
@@ -130,8 +130,6 @@ def _chunks_block(units: list[Unit]) -> str:
             entry.append(f"Texto leído en pantalla:\n{text}")
         if elements := chunk.get("elementos_ui") or []:
             entry.append("Elementos: " + ", ".join(str(e) for e in elements))
-        if narration := _text(chunk, "narracion"):
-            entry.append(f"Narración: {narration}")
         if synthesis := _text(chunk, "sintesis"):
             entry.append(f"Síntesis: {synthesis}")
         if unit.link_pending:

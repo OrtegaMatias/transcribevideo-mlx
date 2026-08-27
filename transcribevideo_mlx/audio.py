@@ -12,7 +12,10 @@ costar una sola llamada a un modelo.
 """
 from __future__ import annotations
 
+import contextlib
+import os
 import subprocess
+import sys
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -91,7 +94,8 @@ def transcribe(video: Path, model: str = "large-v3-turbo",
     kwargs: dict = {"path_or_hf_repo": MODELS[model], "verbose": False}
     if language:
         kwargs["language"] = language
-    result = mlx_whisper.transcribe(str(video), **kwargs)
+    with _muted():
+        result = mlx_whisper.transcribe(str(video), **kwargs)
 
     utterances = [
         Utterance(start=float(s["start"]), end=float(s["end"]), text=s["text"])
@@ -148,6 +152,25 @@ def snap_to_speech(cuts: list[float], transcript: Transcript,
                 break
         snapped.append(candidate if candidate > snapped[-1] else cut)
     return snapped
+
+
+@contextlib.contextmanager
+def _muted():
+    """Silencia a Whisper mientras transcribe.
+
+    `verbose=False` no basta: la barra de tqdm y los avisos de detección de
+    idioma se escriben igual, y aparecen encima del panel vivo dejándolo
+    ilegible. Se redirigen los descriptores a nivel de proceso porque quien
+    escribe es una librería, no este código.
+    """
+    saved_out, saved_err = sys.stdout, sys.stderr
+    devnull = open(os.devnull, "w")
+    sys.stdout = sys.stderr = devnull
+    try:
+        yield
+    finally:
+        sys.stdout, sys.stderr = saved_out, saved_err
+        devnull.close()
 
 
 def _ts(seconds: float) -> str:

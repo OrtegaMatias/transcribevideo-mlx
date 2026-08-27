@@ -37,12 +37,27 @@ def test_unusable_output_raises(text):
         _extract_json(text)
 
 
-def test_reasoning_block_is_dropped():
+def test_qwen_reasoning_block_is_dropped():
     assert _strip_reasoning("<think>\ndivagando\n</think>\n\nrespuesta") == "respuesta"
 
 
-def test_only_the_last_think_marker_counts():
+def test_gemma_reasoning_channel_is_dropped():
+    """Cada familia cierra el canal a su manera.
+
+    gemma abre `<|channel>thought` y cierra con `<channel|>`, con la barra al
+    otro lado. Conocer solo el marcador de Qwen dejaba pasar el razonamiento
+    crudo — y en inglés — al informe final.
+    """
+    raw = "<|channel>thought\nplanning the answer\n<channel|>\n\n## Resumen\nok"
+    assert _strip_reasoning(raw) == "## Resumen\nok"
+
+
+def test_only_the_last_marker_counts():
     assert _strip_reasoning("<think>a</think>b</think>final") == "final"
+
+
+def test_the_latest_closer_wins_across_families():
+    assert _strip_reasoning("</think>medio<channel|>final") == "final"
 
 
 def test_output_without_reasoning_is_untouched():

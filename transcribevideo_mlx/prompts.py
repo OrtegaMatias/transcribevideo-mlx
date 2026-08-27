@@ -11,6 +11,15 @@ modelo:
    modelo al que se le pregunta "¿te falta contexto?" casi siempre responde que
    sí; se le pregunta si la unidad **se entiende sola** y se le exige un corte
    literal para responder que no.
+
+Y una restricción de costo, porque generar es lo caro: el tiempo de una corrida
+lo domina la salida, no la lectura de la imagen. Medido sobre 136 pantallas
+reales, los campos interpretativos se llevaban el 60% de los tokens generados.
+Por eso van acotados en longitud — acotados, no eliminados: `motivo` sigue
+existiendo porque redactar la justificación funciona como razonamiento en
+miniatura y mejora la decisión booleana que la acompaña, y `elementos_ui` es lo
+único que captura iconos y controles sin texto, que `texto_en_pantalla` no puede
+ver por definición.
 """
 
 CHUNK_SYSTEM = """\
@@ -25,7 +34,6 @@ bloques de código, con exactamente estas claves:
   "titulo": string,
   "texto_en_pantalla": string,
   "elementos_ui": [string],
-  "narracion": string,
   "sintesis": string,
   "se_entiende_sola": boolean,
   "motivo": string
@@ -37,17 +45,20 @@ Reglas:
 - "texto_en_pantalla": SOLO texto que puedas LEER literalmente en las imágenes. \
 Transcríbelo respetando etiquetas y valores. Si algo se menciona en el audio \
 pero NO está escrito en la imagen, NO lo incluyas. No completes, no infieras, \
-no corrijas. Si la pantalla no tiene texto legible, deja el string vacío.
-- "elementos_ui": controles visibles (botones, campos, pestañas, tablas, menús).
-- "narracion": qué dijo el narrador en este tramo, resumido y en sus términos.
+no corrijas. Si la pantalla no tiene texto legible, deja el string vacío. \
+Este campo no tiene límite: transcríbelo entero.
+- "elementos_ui": COMO MÁXIMO 5 elementos, los más relevantes de la pantalla. \
+Prioriza los que NO tienen texto legible (iconos, casillas, controles), porque \
+el texto ya va en el campo anterior. Nómbralos en dos o tres palabras.
 - "sintesis": qué se está haciendo o explicando aquí, cruzando lo que se ve con \
-lo que se dice. Es el único campo donde puedes relacionar ambas fuentes.
+lo que se dice. Es el único campo donde puedes relacionar ambas fuentes. \
+UNA sola frase.
 - "se_entiende_sola": true si este tramo forma una unidad comprensible por sí \
 misma. Responde false SOLO si una oración o un procedimiento queda literalmente \
 truncado y se completa en el tramo siguiente. Ante la duda, true.
-- "motivo": una frase justificando el valor de "se_entiende_sola".
+- "motivo": por qué. COMO MÁXIMO 8 palabras, sin repetir el enunciado.
 
-Responde en el mismo idioma del audio."""
+No expliques nada fuera del JSON. Responde en el mismo idioma del audio."""
 
 
 def chunk_user_prompt(window_label: str, window_audio: str,

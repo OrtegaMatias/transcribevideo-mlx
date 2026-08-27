@@ -30,11 +30,11 @@ except Exception:  # noqa: BLE001 - el wordmark es decorativo
 
 from . import __version__
 from .audio import MODELS, snap_to_speech
-from .live import (C1, C2, DIM, ERR, OK, WARN, RunState, clock, compact,
-                   gradient, human, render)
+from .live import (C1, C2, DIM, ERR, OK, WARN, RunState, ScreenRow, clock,
+                   compact, gradient, human, render)
 from .report import render_json, render_markdown, unique_path, write_report
 from .segment import CUT_THRESHOLD, MIN_SCREEN_SECONDS, SAMPLE_FPS
-from .vlm import DEFAULT_MODEL, Usage, resolve_model_path
+from .vlm import DEFAULT_MODEL, DEFAULT_REPORTER, Usage, resolve_model_path
 
 DOWNLOADS = Path.home() / "Downloads"
 #: Mínimo entre repintados. El modelo emite decenas de tokens por segundo y
@@ -44,26 +44,43 @@ REDRAW_INTERVAL = 0.08
 console = Console(file=sys.stdout, highlight=False)
 
 
-def banner(vlm: str, whisper: str) -> Group:
+def banner(vlm: str, reporter: str, whisper: str) -> Group:
     motif = "▚▚▖▘▝▗▚▘▖▝▚▗▘▚▖▝▘▗▚▖▘"
     word = pyfiglet.figlet_format("transcribevideo", font="small") if pyfiglet else "transcribevideo"
     sub = Text("local · mlx · visión + audio · apple silicon", style=DIM, justify="center")
+
+    def short(name: str) -> str:
+        return name.split("/")[-1].replace("-it-QAT", "").replace("-MLX-4bit", "")
+
     cfg = Text(justify="center")
-    cfg.append("visión ", style="grey42"); cfg.append(vlm.split("/")[-1], style="grey70")
+    cfg.append("lee ", style="grey42"); cfg.append(short(vlm), style="grey70")
     cfg.append("   ·   ", style="grey30")
-    cfg.append("audio ", style="grey42"); cfg.append(whisper, style="grey70")
+    cfg.append("redacta ", style="grey42"); cfg.append(short(reporter), style="grey70")
     cfg.append("   ·   ", style="grey30")
-    cfg.append("destino ", style="grey42"); cfg.append("~/Downloads", style="grey70")
+    cfg.append("oye ", style="grey42"); cfg.append(whisper, style="grey70")
     return Group(Text(), Align.center(gradient(motif)), Align.center(gradient(word)),
                  sub, Text(), cfg, Text())
 
 
 class View:
-    """Repintado con throttling sobre el panel vivo."""
+    """Repintado con throttling sobre la vista viva.
 
-    def __init__(self, live: Live, state: RunState, width: int):
-        self.live, self.state, self.width = live, state, width
+    El modelo emite decenas de tokens por segundo; redibujar en cada uno
+    gastaría más CPU en la interfaz que en la inferencia. Se repinta a ritmo
+    fijo y el `frame` avanza igual, que es lo que anima el spinner, el latido de
+    la fila activa y el cursor.
+    """
+
+    def __init__(self, live: Live, state: RunState, width: int, height: int):
+        self.live, self.state = live, state
+        self.width, self.height = width, height
         self._last = 0.0
+
+    def stage(self, key: str, label: str, detail: str = "") -> None:
+        self.state.stage_key = key
+        self.state.stage = label
+        self.state.detail = detail
+        self.draw(force=True)
 
     def draw(self, force: bool = False) -> None:
         now = time.time()
@@ -71,7 +88,12 @@ class View:
             return
         self._last = now
         self.state.frame += 1
-        self.live.update(render(self.state, self.width))
+        self.live.update(render(self.state, self.width, self.height))
+
+
+def _short_model(name: str) -> str:
+    return (name.split("/")[-1].replace("-it-QAT", "").replace("-MLX-4bit", "")
+            .replace("-GGUF", ""))
 
 
 def model_size_gb(model: str) -> float:
@@ -157,16 +179,24 @@ def process(video: Path, args) -> bool:
         console.print(error_panel(video.name, f"No existe el archivo:\n{video}"))
         return False
 
-    state = RunState(name=video.name)
+    state = RunState(name=video.name,
+                     reader_model=_short_model(args.vlm),
+                     writer_model=_short_model(args.reporter))
     frames_dir = DOWNLOADS / f"{video.stem}-frames"
     total_usage = Usage()
 
-    with Live(console=console, refresh_per_second=14, transient=True) as live:
-        view = View(live, state, console.width)
+    # Pantalla completa cuando hay terminal: la vista ocupa todo el alto y al
+    # terminar se restaura lo que había detrás. Sin terminal (salida
+    # redirigida) se degrada para no ensuciar el archivo.
+    full_screen = console.is_terminal
+    height = console.size.height if full_screen else 30
+
+    with Live(console=console, refresh_per_second=20, screen=full_screen,
+              transient=not full_screen) as live:
+        view = View(live, state, console.width, height)
 
         # 1 · segmentar
-        state.stage = "detectando cambios de pantalla"
-        view.draw(force=True)
+        view.stage("segmentar", "detectando cambios de pantalla")
         duration = segment_mod.probe_duration(video)
         state.detail = f"{clock(duration)} de video"
         view.draw(force=True)
@@ -182,9 +212,8 @@ def process(video: Path, args) -> bool:
         view.draw(force=True)
 
         # 2 · audio
-        state.stage = "transcribiendo el audio"
-        state.detail = f"whisper {args.whisper}"
-        view.draw(force=True)
+        state.active_model = f"whisper {args.whisper}"
+        view.stage("oír", "transcribiendo el audio", f"whisper {args.whisper}")
         transcript = audio_mod.transcribe(video, args.whisper, args.lang)
         if transcript.utterances:
             state.detail = (f"{len(transcript.utterances)} segmentos · "
@@ -197,8 +226,8 @@ def process(video: Path, args) -> bool:
         cuts = snap_to_speech(cuts, transcript, duration=duration)
 
         # 3 · extraer los frames elegidos
-        state.stage = "extrayendo frames"
-        view.draw(force=True)
+        state.active_model = ""
+        view.stage("extraer", "extrayendo frames")
         screens = segment_mod.extract_screens(
             video, cuts, duration, frames_dir,
             on_skip=lambda at, why: state.notes.append(
@@ -214,11 +243,11 @@ def process(video: Path, args) -> bool:
             screens = screens[::step][:args.max_screens]
             state.notes.append(f"{dropped} pantallas omitidas por --max-screens")
 
-        # 4 · cargar el modelo
+        # 4 · cargar el modelo lector
         size = model_size_gb(args.vlm)
-        state.stage = "cargando el modelo de visión"
-        state.detail = args.vlm.split("/")[-1] + (f" · {size:.1f} GB" if size else "")
-        view.draw(force=True)
+        state.active_model = state.reader_model
+        view.stage("leer", "cargando el modelo lector",
+                   state.reader_model + (f" · {size:.1f} GB" if size else ""))
         try:
             model = VisionModel(args.vlm)
         except ModelError as exc:
@@ -227,27 +256,42 @@ def process(video: Path, args) -> bool:
             return False
 
         # 5 · analizar pantalla por pantalla
-        state.stage = "leyendo las pantallas"
-        state.detail = ""
         state.screens_total = len(screens)
-        view.draw(force=True)
+        state.rows = [ScreenRow(index=i, at=s.start) for i, s in enumerate(screens)]
+        view.stage("leer", "leyendo las pantallas", f"{len(screens)} pantallas")
 
         def on_call(index: int, span: int) -> None:
             state.screens_done = index
+            state.active = index
             state.merging = span if span > 1 else 0
-            first, last = screens[index], screens[min(index + span - 1, len(screens) - 1)]
-            state.current_label = (f"pantalla {index + 1}   "
+            for row in state.rows[index:index + span]:
+                row.status = "active"
+            first = screens[index]
+            last = screens[min(index + span - 1, len(screens) - 1)]
+            state.current_label = (f"pantalla {index + 1} de {len(screens)}   ·   "
                                    f"{clock(first.start)} – {clock(last.end)}")
             state.reader.reset()
             view.draw(force=True)
 
         def on_delta(delta: str) -> None:
             state.reader.feed(delta)
+            # El título aparece primero en el JSON: en cuanto se lee, la fila
+            # activa deja de decir "leyendo…" y muestra de qué pantalla se trata.
+            if state.reader.field == "titulo":
+                lines = state.reader.lines(limit=1, width=60)
+                if lines:
+                    state.rows[state.active].title = lines[0]
             view.draw()
 
         def on_unit(unit) -> None:
-            state.screens_done = min(state.screens_done + len(unit.screens),
-                                     state.screens_total)
+            state.record_unit(unit.usage.seconds)
+            start = state.active
+            for offset, _screen in enumerate(unit.screens):
+                row = state.rows[start + offset]
+                row.status = ("error" if unit.error
+                              else "merged" if unit.merged else "done")
+                row.title = unit.title if offset == 0 else "…continúa"
+            state.screens_done = min(start + len(unit.screens), state.screens_total)
             state.merging = 0
             total_usage.add(unit.usage)
             state.prompt_tokens = total_usage.prompt_tokens
@@ -256,9 +300,6 @@ def process(video: Path, args) -> bool:
             state.record_tps(unit.usage.tps)
             if unit.error:
                 state.notes.append(f"{clock(unit.start)} sin analizar: {unit.error[:60]}")
-            else:
-                mark = " ⇢" if unit.merged else ""
-                state.done_titles.append(f"{unit.title}{mark}")
             state.reader.reset()
             view.draw(force=True)
 
@@ -267,14 +308,35 @@ def process(video: Path, args) -> bool:
                                      on_delta=on_delta)
 
         # 6 · informe
-        state.stage = "redactando el informe"
-        state.detail = "razonando sobre todas las pantallas"
+        # 6 · informe. La síntesis es una sola llamada y es la única etapa de
+        # razonamiento de la corrida, así que puede permitirse un modelo más
+        # capaz aunque sea lento. Los dos no caben en memoria a la vez.
+        reporter = model
+        if args.reporter != args.vlm:
+            state.rows = []
+            state.screens_total = 0
+            state.reader.reset()
+            state.active_model = state.writer_model
+            view.stage("redactar", "cambiando al modelo de síntesis",
+                       f"{state.reader_model} → {state.writer_model}")
+            model.release()
+            try:
+                reporter = VisionModel(args.reporter)
+            except ModelError as exc:
+                state.notes.append(f"no se pudo cargar {args.reporter}: {exc}")
+                live.stop()
+                console.print(error_panel(video.name, str(exc)))
+                return False
+
         state.current_label = ""
         state.screens_total = 0
+        state.rows = []
         state.reader.reset()
-        view.draw(force=True)
+        state.active_model = state.writer_model
+        view.stage("redactar", "redactando el informe",
+                   f"sintetizando {len(units)} unidades")
 
-        body, report_usage = write_report(model, units, transcript,
+        body, report_usage = write_report(reporter, units, transcript,
                                           on_delta=on_delta)
         total_usage.add(report_usage)
 
@@ -285,7 +347,9 @@ def process(video: Path, args) -> bool:
         encoding="utf-8")
     json_path = unique_path(DOWNLOADS, video.stem, "json")
     json_path.write_text(
-        render_json(video, units, transcript, duration, elapsed, args.vlm,
+        render_json(video, units, transcript, duration, elapsed,
+                    {"reader": args.vlm, "reporter": args.reporter,
+                     "whisper": args.whisper},
                     body, total_usage),
         encoding="utf-8")
 
@@ -302,7 +366,11 @@ def main() -> int:
                         version=f"transcribevideo-mlx {__version__}")
     parser.add_argument("files", nargs="*")
     parser.add_argument("--vlm", default=DEFAULT_MODEL,
-                        help="modelo de visión MLX (repo HF o ruta local)")
+                        help="modelo que lee las pantallas (se elige por velocidad: "
+                             "es la llamada que se repite)")
+    parser.add_argument("--reporter", default=DEFAULT_REPORTER,
+                        help="modelo que redacta el informe final (una sola "
+                             "llamada; usa el mismo id que --vlm para no cambiar)")
     parser.add_argument("--whisper", choices=list(MODELS), default="large-v3-turbo",
                         help="modelo Whisper para el audio")
     parser.add_argument("--lang", default=None, help="fuerza el idioma (es, en, …)")
@@ -317,7 +385,7 @@ def main() -> int:
                         help="tope de pantallas a analizar (0 = sin tope)")
     args = parser.parse_args()
 
-    console.print(banner(args.vlm, args.whisper))
+    console.print(banner(args.vlm, args.reporter, args.whisper))
 
     files = args.files
     if not files:

@@ -1,5 +1,6 @@
 """Lectura incremental del JSON que el modelo va escribiendo."""
-from transcribevideo_mlx.live import FieldReader, compact, spark
+from transcribevideo_mlx.live import (FieldReader, RunState, ScreenRow, compact,
+                                      render, spark)
 
 
 def feed(*deltas: str) -> FieldReader:
@@ -66,3 +67,54 @@ def test_spark_is_empty_without_data():
 
 def test_spark_fits_the_requested_width():
     assert len(spark([1.0, 5.0, 3.0], 10).plain) == 10
+
+
+# ── ventana deslizante de pantallas ─────────────────────────────────────
+
+def state_with(count: int, active: int) -> RunState:
+    st = RunState(rows=[ScreenRow(index=i, at=i * 10.0) for i in range(count)],
+                  active=active, screens_total=count, screens_done=active)
+    for row in st.rows[:active]:
+        row.status = "done"
+    st.rows[active].status = "active"
+    return st
+
+
+def test_window_never_exceeds_its_size():
+    assert len(state_with(200, 90).window(9)) == 9
+
+
+def test_short_runs_show_every_screen():
+    assert len(state_with(4, 1).window(9)) == 4
+
+
+def test_window_keeps_the_active_screen_visible():
+    for active in (0, 1, 57, 198, 199):
+        st = state_with(200, active)
+        assert st.rows[active] in st.window(9)
+
+
+def test_window_shows_what_is_still_queued():
+    """La cola es la mitad del valor: dice hacia dónde va el trabajo."""
+    st = state_with(200, 90)
+    assert any(r.status == "pending" for r in st.window(9))
+
+
+def test_window_at_the_end_does_not_run_off():
+    st = state_with(20, 19)
+    win = st.window(9)
+    assert len(win) == 9
+    assert win[-1].index == 19
+
+
+def test_window_is_empty_before_screens_exist():
+    assert RunState().window(9) == []
+
+
+def test_render_survives_every_stage():
+    """El panel se dibuja igual sin pantallas, con ellas y al redactar."""
+    for st in (RunState(name="x", stage="cargando"),
+               state_with(50, 10),
+               RunState(name="x", stage="redactando", generation_tokens=900)):
+        st.notes.append("un aviso")
+        assert render(st, 100) is not None

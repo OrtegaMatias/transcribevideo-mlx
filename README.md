@@ -52,7 +52,9 @@ video ──┬─► sample at 2fps ─► dhash 1024-bit ─► screen cuts �
    own. If an explanation was cut in half by a screen change, the harness re-runs
    the analysis with both screens merged, so no idea is left dangling.
 
-5. **Report.** A final text-only pass turns all the units into Markdown.
+5. **Report.** A final text-only pass turns all the units into Markdown — and it
+   runs on a *different, more capable model*, because it is the one call in the
+   whole run that is genuinely synthesis rather than reading. See the design notes.
 
 ## What you get
 
@@ -71,7 +73,9 @@ Plus `<name>-frames/` with the frames that were actually analyzed.
 - **macOS on Apple Silicon.** MLX is Apple-Silicon only.
 - **Python 3.10+**
 - **[ffmpeg](https://ffmpeg.org/)** — `brew install ffmpeg`
-- **~20 GB of free RAM** while running, for a 27B 4-bit vision model.
+- **~21 GB of free RAM** while running. Two models are used (see design notes) but
+  never at the same time — the reader is released before the writer loads.
+- **~32 GB of disk** for both models, downloaded once.
 
 ## Installation
 
@@ -80,9 +84,10 @@ uv tool install git+https://github.com/OrtegaMatias/transcribevideo-mlx
 # or: pipx install git+https://github.com/OrtegaMatias/transcribevideo-mlx
 ```
 
-The first run downloads the vision model (~16 GB, cached afterwards). If you already
-have it through LM Studio, it's picked up from `~/.lmstudio/models` instead of being
-downloaded again.
+The first run downloads the two models (~32 GB total, cached afterwards). Anything
+you already have through LM Studio is picked up from `~/.lmstudio/models` instead of
+being downloaded again. To run with a single model, point `--reporter` at the same id
+as `--vlm`.
 
 ## Usage
 
@@ -96,7 +101,8 @@ transcribevideo a.mp4 b.mov              # several at once
 
 | Flag | Description | Default |
 |------|-------------|---------|
-| `--vlm` | Vision model (HF repo id or local path) | `lmstudio-community/Qwen3.8-27B-MLX-4bit` |
+| `--vlm` | Model that reads the screens — chosen for speed, it's the call that repeats | `lmstudio-community/gemma-4-26B-A4B-it-QAT-MLX-4bit` |
+| `--reporter` | Model that writes the final report — one call, chosen for capability | `lmstudio-community/Qwen3.8-27B-MLX-4bit` |
 | `--whisper` | `large-v3-turbo`, `large-v3`, `medium`, `small`, `base`, `tiny` | `large-v3-turbo` |
 | `--lang` | Force a language code (`es`, `en`, …) | auto-detect |
 | `--fps` | Sampling rate for screen-change detection | `2.0` |
@@ -106,11 +112,12 @@ transcribevideo a.mp4 b.mov              # several at once
 
 ### While it runs
 
-The terminal shows the model working rather than a spinner: a progress bar over
-screens, **the JSON field being written and its content arriving live** — you watch
-the text come off the image, line by line — plus a sparkline of tokens/second,
-cumulative prompt and generation tokens, and peak memory. Merges announce
-themselves when a truncated idea pulls in the next screen.
+The terminal shows the model working rather than a spinner. On the left, the work
+queue: screens already read with a green tick, the one in flight highlighted, and
+what's still coming. On the right, **the JSON field being written and its content
+arriving live** — you watch the text come off the image, line by line — with a
+sparkline of tokens/second, cumulative prompt and generation tokens, and peak
+memory. Merges announce themselves when a truncated idea pulls in the next screen.
 
 <p align="center">▚▚▖▘▝▗▚▘▖▝▚▗▘▚▖▝▘▗▚▖▘</p>
 
@@ -149,6 +156,48 @@ Of a burst of rapid changes the surviving cut is the *last* one — the moment t
 screen settled — so the captured frame is settled content rather than a
 half-finished transition. At the 2 s default that recording goes from 154 screens
 to 45.
+
+### Two models, because the two stages want opposite things
+
+The run is dozens of reading calls and exactly one synthesis call. Those have
+different needs, so they get different models.
+
+Reading is repetitive and speed is everything. Measured on identical screens, a
+sparse MoE (gemma-4-26B-A4B: 128 experts, 8 active per token) reads a screen in
+**3.2 s** against **14.7 s** for a dense 27B — 4.6× — while producing the *same*
+amount of output (192 vs 184 tokens) and scoring identically, 35/35, on synthetic
+screens with known ground truth.
+
+Checked against real screens, though, the two are not equal: on a dense phone UI
+the dense model recovered 16 of 18 known elements and the MoE 12 of 18. The gap is
+specific and worth knowing — the MoE misses **peripheral, tiny text**: the status
+bar clock, elements clipped by the frame edge. In the body of the screen they were
+identical, including low-contrast disabled rows. For this tool that loss is cheap
+(the status-bar clock is redundant when every screen already carries an exact video
+timestamp), which is why the fast model reads by default and `--vlm` switches back.
+
+The report is the opposite case: one call, and the only place where the run has to
+reason across everything rather than transcribe. Paying two minutes once for a
+stronger model is a far better trade than paying eleven extra seconds forty times.
+The two do not fit in memory together (~32 GB of weights, 18–21 GB peak each), so
+the reader is released before the writer loads — a few seconds, once.
+
+### Generation dominates the clock, so the schema is a budget
+
+A 62-minute run over a 5-minute recording broke down as ~25 s per screen, and
+prefill — reading the image — was only about 3 s of that. **The cost is the tokens
+the model writes.** Measured across 136 real screens, the interpretive fields ate
+60% of generated tokens while the literal screen text took 37%.
+
+The fix isn't to drop fields but to bound them, because each one earns its place:
+`elementos_ui` is the only thing that captures icons and controls with no text,
+which `texto_en_pantalla` cannot see by definition; and `motivo` looks like dead
+weight — it never reaches the report — but writing the justification acts as a
+miniature chain of thought and improves the boolean continuity verdict it
+accompanies. So `elementos_ui` is capped at five items biased toward non-text
+controls, `motivo` at eight words, `sintesis` at one sentence, and only the
+genuinely duplicated field was removed: the per-screen narration summary, since
+the full transcript already reaches the report verbatim.
 
 ### Local OpenAI-compatible servers may not count image tokens
 
