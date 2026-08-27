@@ -1,0 +1,129 @@
+"""Orquestación: de pantallas y transcripción a unidades de información.
+
+Aquí vive el mecanismo de continuidad. Una pantalla puede cambiar a mitad de
+una explicación, y analizar ese tramo por separado produce dos mitades que no
+se entienden solas. El modelo juzga si su tramo está completo; si declara que
+no, el harness descarta ese análisis y vuelve a llamar fusionando la pantalla
+siguiente, hasta que la unidad cierre o hasta tocar el tope.
+
+Tres salvaguardas evitan que eso degenere:
+
+- **Una sola dirección.** Solo se pregunta si la idea sigue hacia adelante.
+  "Me falta lo anterior" y "mi idea continúa" son el mismo evento visto desde
+  los dos lados, así que mirar solo hacia adelante cubre ambos casos sin tener
+  que rehacer una unidad ya emitida.
+- **Tope duro.** Una unidad no crece más allá de MAX_SCREENS_PER_UNIT. Sin él,
+  una cadena A→B→C fusionaría el video entero en una sola llamada.
+- **Degradación, no fallo.** Al llegar al tope se marca `enlace_pendiente` y el
+  informe final cose la idea, que tiene todos los tramos a la vista.
+"""
+from __future__ import annotations
+
+from dataclasses import dataclass, field
+from typing import Callable
+
+from .audio import Transcript
+from .prompts import CHUNK_SYSTEM, chunk_user_prompt
+from .segment import Screen
+from .vlm import ModelError, VisionModel
+
+#: Máximo de pantallas que se pueden fusionar en una unidad.
+MAX_SCREENS_PER_UNIT = 3
+#: Segundos de audio vecino que se muestran como contexto no analizable, para
+#: que el modelo pueda juzgar si su tramo quedó truncado.
+PREVIEW_SECONDS = 15.0
+
+
+@dataclass
+class Unit:
+    """Un tramo analizado: una o más pantallas y su información extraída."""
+
+    index: int
+    screens: list[Screen]
+    start: float
+    end: float
+    chunk: dict = field(default_factory=dict)
+    link_pending: bool = False
+    error: str | None = None
+
+    @property
+    def merged(self) -> bool:
+        return len(self.screens) > 1
+
+    @property
+    def title(self) -> str:
+        return (self.chunk.get("titulo") or "").strip() or "(sin título)"
+
+
+def analyze(model: VisionModel, screens: list[Screen], transcript: Transcript,
+            on_call: Callable[[int, int], None] | None = None,
+            on_unit: Callable[[Unit], None] | None = None) -> list[Unit]:
+    """Convierte las pantallas en unidades de información.
+
+    `on_call` se invoca antes de cada llamada al modelo con (pantalla_inicial,
+    pantallas_en_la_unidad) para que la UI muestre avance real, incluidas las
+    llamadas extra que consume una fusión.
+    """
+    units: list[Unit] = []
+    start_index = 0
+
+    while start_index < len(screens):
+        span, unit = 1, None
+
+        while True:
+            group = screens[start_index:start_index + span]
+            if on_call:
+                on_call(start_index, span)
+
+            unit = _analyze_group(model, len(units), group, transcript)
+
+            complete = bool(unit.chunk.get("se_entiende_sola", True))
+            at_cap = span >= MAX_SCREENS_PER_UNIT
+            no_more = start_index + span >= len(screens)
+
+            if unit.error or complete:
+                break
+            if at_cap or no_more:
+                unit.link_pending = True
+                break
+            span += 1  # reintenta la unidad fusionando la pantalla siguiente
+
+        units.append(unit)
+        if on_unit:
+            on_unit(unit)
+        start_index += span
+
+    return units
+
+
+def _analyze_group(model: VisionModel, index: int, group: list[Screen],
+                   transcript: Transcript) -> Unit:
+    start, end = group[0].start, group[-1].end
+    unit = Unit(index=index, screens=list(group), start=start, end=end)
+
+    prompt = chunk_user_prompt(
+        window_label=f"{_ts(start)} → {_ts(end)}",
+        window_audio=transcript.stamped_between(start, end),
+        previous_tail=transcript.stamped_between(
+            max(0.0, start - PREVIEW_SECONDS), start),
+        next_head=transcript.stamped_between(end, end + PREVIEW_SECONDS),
+        n_screens=len(group),
+    )
+
+    try:
+        unit.chunk = model.analyze_screen(
+            CHUNK_SYSTEM, prompt, [s.frame for s in group])
+    except ModelError as exc:
+        # Un tramo ilegible no debe costar la corrida entera: se marca y el
+        # informe final lo verá como un hueco declarado.
+        unit.error = str(exc)
+        unit.chunk = {}
+    return unit
+
+
+def _ts(seconds: float) -> str:
+    minutes, secs = divmod(int(round(seconds)), 60)
+    hours, minutes = divmod(minutes, 60)
+    if hours:
+        return f"{hours:d}:{minutes:02d}:{secs:02d}"
+    return f"{minutes:02d}:{secs:02d}"
