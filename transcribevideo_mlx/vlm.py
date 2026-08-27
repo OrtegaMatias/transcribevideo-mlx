@@ -14,8 +14,9 @@ encendido para el informe final, que sí es una tarea de síntesis.
 from __future__ import annotations
 
 import json
-import os
+from dataclasses import dataclass, field
 from pathlib import Path
+from typing import Callable
 
 DEFAULT_MODEL = "lmstudio-community/Qwen3.8-27B-MLX-4bit"
 #: Techo de generación por pantalla. Un chunk típico ronda los 400 tokens; el
@@ -27,6 +28,33 @@ REPORT_MAX_TOKENS = 4000
 
 class ModelError(RuntimeError):
     """El modelo no se pudo cargar o devolvió algo inutilizable."""
+
+
+@dataclass
+class Usage:
+    """Lo que costó una llamada. Se acumula a lo largo de la corrida."""
+
+    prompt_tokens: int = 0
+    generation_tokens: int = 0
+    calls: int = 0
+    seconds: float = 0.0
+    peak_memory: float = 0.0
+    #: Tokens por segundo de la última llamada.
+    tps: float = 0.0
+
+    def add(self, other: "Usage") -> None:
+        self.prompt_tokens += other.prompt_tokens
+        self.generation_tokens += other.generation_tokens
+        self.calls += other.calls
+        self.seconds += other.seconds
+        self.peak_memory = max(self.peak_memory, other.peak_memory)
+        self.tps = other.tps
+
+
+@dataclass
+class Generation:
+    text: str = ""
+    usage: Usage = field(default_factory=Usage)
 
 
 def resolve_model_path(model: str = DEFAULT_MODEL) -> str:
@@ -57,40 +85,48 @@ class VisionModel:
                 f"No se pudo cargar el modelo '{model}'.\n{exc}") from exc
         self.name = model
 
-    def analyze_screen(self, system: str, user: str,
-                       images: list[Path]) -> dict:
-        """Analiza un tramo y devuelve el chunk ya parseado.
+    def analyze_screen(self, system: str, user: str, images: list[Path],
+                       on_delta: Callable[[str], None] | None = None
+                       ) -> tuple[dict, Usage]:
+        """Analiza un tramo y devuelve el chunk parseado y lo que costó.
 
         Un modelo que devuelve JSON inválido casi siempre lo arregla al
         reintentar; si falla dos veces se propaga el error y el tramo se marca
         como fallido en vez de tumbar la corrida entera.
         """
-        raw = self._generate(system, user, images,
-                             max_tokens=CHUNK_MAX_TOKENS, thinking=False)
+        run = self._generate(system, user, images, max_tokens=CHUNK_MAX_TOKENS,
+                             thinking=False, on_delta=on_delta)
         try:
-            return _extract_json(raw)
+            return _extract_json(run.text), run.usage
         except ValueError:
             retry = self._generate(
                 system,
                 user + "\n\nDevuelve SOLO el objeto JSON, sin ningún otro texto.",
-                images, max_tokens=CHUNK_MAX_TOKENS, thinking=False)
+                images, max_tokens=CHUNK_MAX_TOKENS, thinking=False,
+                on_delta=on_delta)
+            run.usage.add(retry.usage)
             try:
-                return _extract_json(retry)
+                return _extract_json(retry.text), run.usage
             except ValueError as exc:
                 raise ModelError(
-                    f"El modelo no devolvió JSON válido: {retry[:200]}") from exc
+                    f"El modelo no devolvió JSON válido: {retry.text[:200]}") from exc
 
-    def write_report(self, system: str, user: str) -> str:
+    def write_report(self, system: str, user: str,
+                     on_delta: Callable[[str], None] | None = None
+                     ) -> tuple[str, Usage]:
         """Redacta el informe final. Sin imágenes: solo texto ya extraído."""
-        raw = self._generate(system, user, [],
-                             max_tokens=REPORT_MAX_TOKENS, thinking=True,
-                             reasoning_effort="medium")
-        return raw.strip()
+        run = self._generate(system, user, [], max_tokens=REPORT_MAX_TOKENS,
+                             thinking=True, reasoning_effort="medium",
+                             on_delta=on_delta)
+        return run.text.strip(), run.usage
 
     def _generate(self, system: str, user: str, images: list[Path],
                   max_tokens: int, thinking: bool,
-                  reasoning_effort: str = "low") -> str:
-        from mlx_vlm import generate
+                  reasoning_effort: str = "low",
+                  on_delta: Callable[[str], None] | None = None) -> Generation:
+        import time
+
+        from mlx_vlm import stream_generate
         from mlx_vlm.prompt_utils import apply_chat_template
 
         messages = [{"role": "system", "content": system},
@@ -103,13 +139,26 @@ class VisionModel:
             self._processor, self._config, messages,
             num_images=len(images), **template_kwargs)
 
-        result = generate(
-            self._model, self._processor, prompt,
-            image=[str(p) for p in images] or None,
-            max_tokens=max_tokens, temperature=0.0, verbose=False)
+        started = time.time()
+        pieces: list[str] = []
+        usage = Usage(calls=1)
 
-        text = result.text if hasattr(result, "text") else str(result)
-        return _strip_reasoning(text)
+        for chunk in stream_generate(
+                self._model, self._processor, prompt,
+                image=[str(p) for p in images] or None,
+                max_tokens=max_tokens, temperature=0.0):
+            if chunk.text:
+                pieces.append(chunk.text)
+                if on_delta:
+                    on_delta(chunk.text)
+            usage.prompt_tokens = chunk.prompt_tokens or usage.prompt_tokens
+            usage.generation_tokens = (chunk.generation_tokens
+                                       or usage.generation_tokens)
+            usage.tps = chunk.generation_tps or usage.tps
+            usage.peak_memory = chunk.peak_memory or usage.peak_memory
+
+        usage.seconds = time.time() - started
+        return Generation(text=_strip_reasoning("".join(pieces)), usage=usage)
 
 
 def _strip_reasoning(text: str) -> str:

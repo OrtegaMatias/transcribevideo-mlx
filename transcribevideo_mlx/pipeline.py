@@ -25,7 +25,7 @@ from typing import Callable
 from .audio import Transcript
 from .prompts import CHUNK_SYSTEM, chunk_user_prompt
 from .segment import Screen
-from .vlm import ModelError, VisionModel
+from .vlm import ModelError, Usage, VisionModel
 
 #: Máximo de pantallas que se pueden fusionar en una unidad.
 MAX_SCREENS_PER_UNIT = 3
@@ -43,6 +43,7 @@ class Unit:
     start: float
     end: float
     chunk: dict = field(default_factory=dict)
+    usage: Usage = field(default_factory=Usage)
     link_pending: bool = False
     error: str | None = None
 
@@ -57,25 +58,32 @@ class Unit:
 
 def analyze(model: VisionModel, screens: list[Screen], transcript: Transcript,
             on_call: Callable[[int, int], None] | None = None,
-            on_unit: Callable[[Unit], None] | None = None) -> list[Unit]:
+            on_unit: Callable[[Unit], None] | None = None,
+            on_delta: Callable[[str], None] | None = None) -> list[Unit]:
     """Convierte las pantallas en unidades de información.
 
     `on_call` se invoca antes de cada llamada al modelo con (pantalla_inicial,
     pantallas_en_la_unidad) para que la UI muestre avance real, incluidas las
-    llamadas extra que consume una fusión.
+    llamadas extra que consume una fusión. `on_delta` recibe cada fragmento de
+    texto que el modelo va generando.
     """
     units: list[Unit] = []
     start_index = 0
 
     while start_index < len(screens):
         span, unit = 1, None
+        # Una fusión tira a la basura el análisis previo, pero esos tokens se
+        # gastaron igual. Se acumulan para no subreportar lo que costó la
+        # corrida.
+        spent = Usage()
 
         while True:
             group = screens[start_index:start_index + span]
             if on_call:
                 on_call(start_index, span)
 
-            unit = _analyze_group(model, len(units), group, transcript)
+            unit = _analyze_group(model, len(units), group, transcript, on_delta)
+            spent.add(unit.usage)
 
             complete = bool(unit.chunk.get("se_entiende_sola", True))
             at_cap = span >= MAX_SCREENS_PER_UNIT
@@ -88,6 +96,7 @@ def analyze(model: VisionModel, screens: list[Screen], transcript: Transcript,
                 break
             span += 1  # reintenta la unidad fusionando la pantalla siguiente
 
+        unit.usage = spent
         units.append(unit)
         if on_unit:
             on_unit(unit)
@@ -97,7 +106,8 @@ def analyze(model: VisionModel, screens: list[Screen], transcript: Transcript,
 
 
 def _analyze_group(model: VisionModel, index: int, group: list[Screen],
-                   transcript: Transcript) -> Unit:
+                   transcript: Transcript,
+                   on_delta: Callable[[str], None] | None = None) -> Unit:
     start, end = group[0].start, group[-1].end
     unit = Unit(index=index, screens=list(group), start=start, end=end)
 
@@ -111,8 +121,8 @@ def _analyze_group(model: VisionModel, index: int, group: list[Screen],
     )
 
     try:
-        unit.chunk = model.analyze_screen(
-            CHUNK_SYSTEM, prompt, [s.frame for s in group])
+        unit.chunk, unit.usage = model.analyze_screen(
+            CHUNK_SYSTEM, prompt, [s.frame for s in group], on_delta)
     except ModelError as exc:
         # Un tramo ilegible no debe costar la corrida entera: se marca y el
         # informe final lo verá como un hueco declarado.

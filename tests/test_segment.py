@@ -1,7 +1,8 @@
 """Detección de cambios de pantalla por dhash."""
 import random
 
-from transcribevideo_mlx.segment import (HASH_BITS, HASH_H, HASH_W, _dhash,
+from transcribevideo_mlx.segment import (HASH_BITS, HASH_H, HASH_W,
+                                         absorb_transients, _dhash,
                                          _representative_instant, find_cuts)
 
 SIZE = HASH_W * HASH_H
@@ -93,3 +94,42 @@ def test_representative_instant_waits_out_the_transition():
 def test_representative_instant_never_passes_a_short_screen():
     """En un tramo corto se captura en la mitad, no fuera de él."""
     assert _representative_instant(10.0, 11.0) == 10.5
+
+
+def test_a_burst_of_changes_collapses_to_where_it_settled():
+    """De una animación sobrevive el instante en que la pantalla se estabiliza.
+
+    Así el frame representativo sale de contenido asentado y no de un fotograma
+    a mitad de la transición.
+    """
+    cuts = [0.0, 10.0, 10.4, 10.8, 11.2, 30.0]
+    assert absorb_transients(cuts, 45.0, 2.0) == [0.0, 11.2, 30.0]
+
+
+def test_screens_that_persist_are_kept():
+    cuts = [0.0, 10.0, 14.0, 30.0]
+    assert absorb_transients(cuts, 45.0, 2.0) == cuts
+
+
+def test_the_start_of_the_video_is_always_a_screen():
+    """Aunque el primer tramo sea breve, 0.0 es el inicio y no se puede fundir."""
+    assert absorb_transients([0.0, 0.5, 20.0], 40.0, 2.0)[0] == 0.0
+
+
+def test_the_last_screen_is_measured_against_the_video_end():
+    assert absorb_transients([0.0, 30.0], 31.0, 2.0) == [0.0]
+    assert absorb_transients([0.0, 30.0], 40.0, 2.0) == [0.0, 30.0]
+
+
+def test_absorbing_never_loses_time():
+    """El video entero sigue cubierto: los tramos fundidos no dejan huecos."""
+    cuts = [0.0, 5.0, 5.3, 5.6, 20.0, 20.2, 40.0]
+    kept = absorb_transients(cuts, 50.0, 2.0)
+    bounds = kept + [50.0]
+    assert kept[0] == 0.0
+    assert all(b > a for a, b in zip(bounds, bounds[1:]))
+    assert bounds[-1] == 50.0
+
+
+def test_empty_cuts():
+    assert absorb_transients([], 10.0, 2.0) == []

@@ -51,6 +51,29 @@ def test_no_speech_leaves_cuts_untouched():
     assert snap_to_speech([0.0, 10.0], transcript()) == [0.0, 10.0]
 
 
+def test_last_cut_never_leaves_the_video():
+    """Whisper emite timestamps más allá del final del medio.
+
+    Medido sobre un video real de 305.9s: su último segmento terminaba en
+    318.8s. Sin techo, el último corte se va fuera del video y no hay ningún
+    frame que extraer ahí.
+    """
+    snapped = snap_to_speech([0.0, 303.0], transcript((300.0, 306.5)),
+                             duration=305.9)
+    assert snapped[-1] < 305.9
+
+
+def test_duration_ceiling_still_allows_a_snap_that_fits():
+    snapped = snap_to_speech([0.0, 303.0], transcript((300.0, 304.5)),
+                             duration=305.9)
+    assert snapped == [0.0, 304.5]
+
+
+def test_without_duration_the_last_cut_is_unbounded():
+    """Compatibilidad: sin duración no hay techo que aplicar."""
+    assert snap_to_speech([0.0, 303.0], transcript((300.0, 306.5))) == [0.0, 306.5]
+
+
 def test_between_assigns_each_utterance_to_exactly_one_window():
     """Una frase a caballo entre dos pantallas no puede contarse dos veces."""
     tr = transcript((0, 4), (4, 9), (9, 14), (14, 20))

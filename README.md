@@ -101,7 +101,16 @@ transcribevideo a.mp4 b.mov              # several at once
 | `--lang` | Force a language code (`es`, `en`, …) | auto-detect |
 | `--fps` | Sampling rate for screen-change detection | `2.0` |
 | `--threshold` | dhash distance (of 1024) to call it a new screen | `50` |
+| `--min-screen` | Seconds a screen must persist to be analyzed; briefer stretches are folded into the previous one | `2.0` |
 | `--max-screens` | Cap on screens analyzed (0 = no cap) | `0` |
+
+### While it runs
+
+The terminal shows the model working rather than a spinner: a progress bar over
+screens, **the JSON field being written and its content arriving live** — you watch
+the text come off the image, line by line — plus a sparkline of tokens/second,
+cumulative prompt and generation tokens, and peak memory. Merges announce
+themselves when a truncated idea pulls in the next screen.
 
 <p align="center">▚▚▖▘▝▗▚▘▖▝▚▗▘▚▖▝▘▗▚▖▘</p>
 
@@ -123,6 +132,23 @@ different screens, 4 bits for the same screen re-encoded), with a stable thresho
 plateau from 20 to 60. Note that the classic 64-bit 8×8 dhash is *not* enough here:
 the two most similar screens land 5 bits apart, indistinguishable from noise. UI
 needs the finer grid.
+
+### A screen is defined by how long it stays, not by how different it looks
+
+Pixel distance alone over-segments badly. On a real phone screen recording
+(5 minutes, animated content), a 1024-bit dhash found **154 distinct screens** —
+about 38 minutes of model time for 5 minutes of video. The distribution explains
+why: the **median screen lasted 0.5 s**, and 71% lasted under 2 s. Those are
+animation frames, not screens. Nobody reads or narrates something that was up for
+half a second.
+
+So the second filter is temporal, not visual: a stretch shorter than `--min-screen`
+is **folded into the preceding screen** rather than dropped, so the narration
+spoken over a transition still belongs somewhere and no time goes unaccounted for.
+Of a burst of rapid changes the surviving cut is the *last* one — the moment the
+screen settled — so the captured frame is settled content rather than a
+half-finished transition. At the 2 s default that recording goes from 154 screens
+to 45.
 
 ### Local OpenAI-compatible servers may not count image tokens
 
@@ -153,7 +179,13 @@ which genuinely is synthesis, keeps reasoning on.
   watch for. Compare `texto_en_pantalla` against the frames in the JSON if it matters.
 - **Continuity merging is capped at 3 screens.** Beyond that the unit is flagged and
   the final report stitches the idea instead.
-- Runtime is dominated by the per-screen calls: roughly 10–20 s each on an M-series Pro.
+- **Runtime scales with unique screens, not video length.** Each screen costs roughly
+  10–20 s on an M-series Pro. A calm, static UI walkthrough yields few screens and
+  runs fast; a recording full of animation yields many. If a run looks too long, raise
+  `--min-screen` before anything else — it's the knob with the most leverage.
+- **Whisper timestamps can run past the end of the media** (measured: a segment ending
+  at 318.8 s on a 305.9 s video). The video duration bounds them here, but be aware of
+  it if you consume the raw transcript from the JSON.
 
 ## Acknowledgements
 

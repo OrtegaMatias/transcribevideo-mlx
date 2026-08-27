@@ -18,6 +18,7 @@ from __future__ import annotations
 import subprocess
 from dataclasses import dataclass
 from pathlib import Path
+from typing import Callable
 
 # dhash de 32x32 necesita una columna extra para comparar pares adyacentes.
 HASH_W, HASH_H = 33, 32
@@ -30,6 +31,12 @@ CUT_THRESHOLD = 50
 #: Segundos a esperar tras un corte antes de capturar el frame representativo,
 #: para no fotografiar una animación de transición a medio camino.
 SETTLE_SECONDS = 1.0
+#: Cuánto debe permanecer una pantalla para valerle una llamada al modelo.
+#: No es un ajuste de rendimiento sino de criterio: nadie lee ni narra algo que
+#: estuvo medio segundo. En una grabación de teléfono con contenido animado, la
+#: duración mediana de "pantalla" medida fue de 0.5s y el 71% no llegaba a 2s —
+#: todas ellas fotogramas de animación, no pantallas.
+MIN_SCREEN_SECONDS = 2.0
 #: Ancho máximo del frame que se le manda al VLM. A 1280px una pantalla cuesta
 #: ~900 tokens visuales en Qwen3-VL; subirlo encarece cada llamada sin mejorar
 #: el OCR de una UI.
@@ -105,17 +112,63 @@ def find_cuts(hashes: list[int], fps: float = SAMPLE_FPS,
     return cuts
 
 
-def extract_screens(video: Path, cuts: list[float], duration: float,
-                    out_dir: Path) -> list[Screen]:
-    """Extrae en resolución completa un frame representativo por tramo."""
-    out_dir.mkdir(parents=True, exist_ok=True)
+def absorb_transients(cuts: list[float], duration: float,
+                      min_seconds: float = MIN_SCREEN_SECONDS) -> list[float]:
+    """Funde en la pantalla anterior los tramos demasiado breves para ser una.
+
+    Se **absorben**, no se descartan: el corte desaparece y la pantalla previa
+    extiende su ventana sobre él, así que el audio que se dijo durante la
+    animación sigue perteneciendo a alguna pantalla y no se pierde nada.
+
+    De una ráfaga de cambios rápidos (10.0 → 10.4 → 10.8 → 11.2 → estable) el
+    corte que sobrevive es el **último**, el instante en que la pantalla se
+    estabilizó. Es lo que se quiere: el frame representativo sale de contenido
+    asentado y no de un fotograma a mitad de la transición, y la animación
+    entera queda contabilizada en la pantalla saliente.
+
+    El primer corte siempre se conserva porque es el inicio del video.
+    """
+    if not cuts:
+        return []
     bounds = cuts + [duration]
+    return [cuts[0]] + [cut for i, cut in enumerate(cuts[1:], start=1)
+                        if bounds[i + 1] - cut >= min_seconds]
+
+
+def extract_screens(video: Path, cuts: list[float], duration: float,
+                    out_dir: Path,
+                    on_skip: Callable[[float, str], None] | None = None
+                    ) -> list[Screen]:
+    """Extrae en resolución completa un frame representativo por tramo.
+
+    Tolerante por diseño. Extraer frames es el último paso barato antes de
+    decenas de llamadas al modelo, y ya viene después de una transcripción
+    completa: que un solo frame ilegible tumbe la corrida entera cuesta
+    minutos de trabajo ya hecho. Un tramo que no se puede capturar se reporta
+    por `on_skip` y se descarta.
+    """
+    out_dir.mkdir(parents=True, exist_ok=True)
+
+    # Un corte fuera del video no tiene ningún frame que extraer. No debería
+    # llegar ninguno, pero es la última línea antes de un fallo duro.
+    usable = [c for c in cuts if c < duration]
+    bounds = usable + [duration]
+
     screens = []
-    for i, start in enumerate(cuts):
+    for i, start in enumerate(usable):
         end = bounds[i + 1]
-        at = _representative_instant(start, end)
         frame = out_dir / f"screen-{i:04d}.png"
-        _grab_frame(video, at, frame)
+        try:
+            _grab_frame(video, _representative_instant(start, end), frame)
+        except FFmpegError as first:
+            try:
+                # Reintento pegado al inicio del tramo: cerca del final del
+                # video puede no haber frame después del último keyframe.
+                _grab_frame(video, start, frame)
+            except FFmpegError:
+                if on_skip:
+                    on_skip(start, str(first))
+                continue
         screens.append(Screen(index=i, start=start, end=end, frame=frame))
     return screens
 

@@ -15,15 +15,16 @@ from pathlib import Path
 from .audio import Transcript
 from .pipeline import Unit
 from .prompts import REPORT_SYSTEM, report_user_prompt
-from .vlm import VisionModel
+from .vlm import Usage, VisionModel
 
 
 def write_report(model: VisionModel, units: list[Unit],
-                 transcript: Transcript) -> str:
+                 transcript: Transcript, on_delta=None) -> tuple[str, Usage]:
     """Pide al modelo el informe en Markdown a partir de las unidades."""
     return model.write_report(
         REPORT_SYSTEM,
-        report_user_prompt(_chunks_block(units), transcript.full_text))
+        report_user_prompt(_chunks_block(units), transcript.full_text),
+        on_delta)
 
 
 def render_markdown(video: Path, body: str, units: list[Unit],
@@ -77,7 +78,7 @@ def render_markdown(video: Path, body: str, units: list[Unit],
 
 def render_json(video: Path, units: list[Unit], transcript: Transcript,
                 duration: float, elapsed: float, model_name: str,
-                report_body: str) -> str:
+                report_body: str, usage: Usage | None = None) -> str:
     """Todo lo intermedio, para regenerar el informe sin reprocesar el video."""
     payload = {
         "video": str(video),
@@ -86,6 +87,7 @@ def render_json(video: Path, units: list[Unit], transcript: Transcript,
         "generated_at": datetime.now().isoformat(timespec="seconds"),
         "model": model_name,
         "language": transcript.language,
+        "usage": asdict(usage) if usage else None,
         "report": report_body,
         "units": [
             {
@@ -96,6 +98,7 @@ def render_json(video: Path, units: list[Unit], transcript: Transcript,
                 "link_pending": unit.link_pending,
                 "error": unit.error,
                 "frames": [str(s.frame) for s in unit.screens],
+                "usage": asdict(unit.usage),
                 "chunk": unit.chunk,
             }
             for unit in units
