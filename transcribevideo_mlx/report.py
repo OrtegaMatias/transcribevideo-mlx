@@ -27,6 +27,31 @@ def write_report(model: VisionModel, units: list[Unit],
         on_delta)
 
 
+def fallback_body(units: list[Unit], reason: str) -> str:
+    """Informe sin modelo, armado con lo que ya se extrajo.
+
+    Existe para no perder una corrida entera cuando la síntesis no se puede
+    hacer. Leer las pantallas es la parte cara; si al llegar al informe falta
+    memoria, tirar todo ese trabajo es el peor desenlace posible. Esto entrega
+    un documento honesto —sin síntesis, pero con todo lo leído y su línea de
+    tiempo— y dice con claridad qué falta.
+    """
+    lineas = [f"> **Informe sin síntesis.** {reason}",
+              ">",
+              "> Lo que sigue es el material extraído del video, completo y "
+              "auditable. Falta únicamente la redacción final, que puedes "
+              "generar después a partir del `.json` sin volver a procesar el video.",
+              "", "## Resumen", ""]
+    ok = [u for u in units if not u.error]
+    lineas.append(
+        f"Se analizaron {sum(len(u.screens) for u in units)} pantallas en "
+        f"{len(units)} unidades. Los títulos detectados, en orden:")
+    lineas.append("")
+    for u in ok:
+        lineas.append(f"- **{_ts(u.start)}** · {u.title}")
+    return "\n".join(lineas)
+
+
 def render_markdown(video: Path, body: str, units: list[Unit],
                     transcript: Transcript, duration: float,
                     elapsed: float) -> str:

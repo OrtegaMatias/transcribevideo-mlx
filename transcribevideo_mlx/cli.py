@@ -17,6 +17,7 @@ import sys
 import threading
 import time
 import warnings
+import contextlib
 from pathlib import Path
 
 from rich import box
@@ -35,12 +36,14 @@ except Exception:  # noqa: BLE001 - el wordmark es decorativo
 
 from . import __version__
 from .audio import MODELS, snap_to_speech
+from .events import EventStream, EventView
 from .live import (C1, C2, DIM, ERR, OK, WARN, RunState, ScreenRow, clock,
                    compact, gradient, human, interp, render)
-from .report import render_json, render_markdown, unique_path, write_report
+from .report import (fallback_body, render_json, render_markdown,
+                     unique_path, write_report)
 from .segment import CUT_THRESHOLD, MIN_SCREEN_SECONDS, SAMPLE_FPS
-from .vlm import (DEFAULT_MODEL, DEFAULT_REPORTER, Usage, available_memory_gb,
-                  check_headroom, resolve_model_path)
+from .vlm import (DEFAULT_MODEL, DEFAULT_REPORTER, Usage, check_headroom,
+                  other_instances, resolve_model_path, total_memory_gb)
 
 DOWNLOADS = Path.home() / "Downloads"
 #: Mínimo entre repintados. El modelo emite decenas de tokens por segundo y
@@ -218,13 +221,16 @@ def pipeline_card(vlm: str, reporter: str, whisper: str, width: int) -> Panel:
 
     # La memoria es la única de estas condiciones que cambia entre una corrida y
     # la siguiente. Sin ella el sistema no da un error: se congela.
-    libre = available_memory_gb()
-    necesita = max(reader_size, writer_size) * 1.35 or 21.0
+    total = total_memory_gb()
+    necesita = (max(reader_size, writer_size) or 16.0) * 1.35
+    otras = other_instances()
     holgura = Text()
-    if libre >= necesita:
-        holgura.append(f"✓ {libre:.0f} GB libres", style=OK)
+    if otras:
+        holgura.append(f"⚠ {otras} corrida(s) ya", style=WARN)
+    elif necesita <= total - 8:
+        holgura.append(f"✓ {total:.0f} GB", style=OK)
     else:
-        holgura.append(f"⚠ solo {libre:.0f} GB", style=WARN)
+        holgura.append(f"⚠ solo {total:.0f} GB", style=WARN)
     table.add_row(Text("⑤", style=C2), Text("memoria", style="grey74"),
                   Text(f"~{necesita:.0f} GB en uso", style="grey50"),
                   holgura)
@@ -292,6 +298,9 @@ class View:
         self.state.detail = detail
         self.state.stage_started = time.time()
         self.draw(force=True)
+
+    def event(self, kind: str, **data) -> None:
+        """La vista humana no emite eventos; los dibuja. Ver events.EventView."""
 
     def work(self, fn):
         """Ejecuta algo bloqueante sin que la vista se congele.
@@ -477,7 +486,7 @@ def process(video: Path, args) -> Path | None:
     # Pantalla completa cuando hay terminal: la vista ocupa todo el alto y al
     # terminar se restaura lo que había detrás. Sin terminal (salida
     # redirigida) se degrada para no ensuciar el archivo.
-    full_screen = console.is_terminal
+    full_screen = console.is_terminal and not args.events
     height = console.size.height if full_screen else 30
 
     # `auto_refresh` apagado a propósito: con él, Rich levanta un hilo que
@@ -486,9 +495,13 @@ def process(video: Path, args) -> Path | None:
     # terminal— compitiendo por el GIL con el hilo que genera tokens. Ese exceso
     # se veía como tirones, no como fluidez. Aquí pinta solo quien tiene algo
     # nuevo que mostrar.
-    with Live(console=console, screen=full_screen, auto_refresh=False,
-              transient=not full_screen) as live:
-        view = View(live, state, console.width, height)
+    live_ctx = (contextlib.nullcontext() if args.events else
+                Live(console=console, screen=full_screen, auto_refresh=False,
+                     transient=not full_screen))
+    with live_ctx as live:
+        view = (EventView(state, EventStream()) if args.events
+                else View(live, state, console.width, height))
+        view.event("start", video=str(video), name=video.name)
 
         # 1 · segmentar
         view.stage("segmentar", "detectando cambios de pantalla")
@@ -506,6 +519,8 @@ def process(video: Path, args) -> Path | None:
                 "fundidos en la pantalla anterior (animaciones)")
         state.summary = run_summary(state, args.whisper, duration,
                                     len(raw_cuts), len(cuts))
+        view.event("segmented", duration=duration, raw=len(raw_cuts),
+                   screens=len(cuts), absorbed=len(raw_cuts) - len(cuts))
         view.draw(force=True)
 
         # 2 · audio
@@ -536,6 +551,9 @@ def process(video: Path, args) -> Path | None:
 
         state.summary = run_summary(state, args.whisper, duration, len(raw_cuts),
                                     len(cuts), transcript)
+        view.event("transcribed", language=transcript.language,
+                   segments=len(transcript.utterances),
+                   words=len(transcript.full_text.split()))
         cuts = snap_to_speech(cuts, transcript, duration=duration)
 
         # 3 · extraer los frames elegidos
@@ -546,7 +564,7 @@ def process(video: Path, args) -> Path | None:
             on_skip=lambda at, why: state.notes.append(
                 f"pantalla en {clock(at)} descartada, no se pudo extraer")))
         if not screens:
-            live.stop()
+            if live: live.stop()
             console.print(error_panel(video.name, "No se pudo extraer ninguna pantalla."))
             return None
 
@@ -562,14 +580,14 @@ def process(video: Path, args) -> Path | None:
         view.stage("leer", "cargando el modelo lector",
                    state.reader_model + (f" · {size:.1f} GB" if size else ""))
         if aviso := check_headroom(args.vlm, size):
-            live.stop()
+            if live: live.stop()
             console.print(error_panel("memoria insuficiente", aviso))
             return None
 
         try:
             model = view.work(lambda: VisionModel(args.vlm))
         except ModelError as exc:
-            live.stop()
+            if live: live.stop()
             console.print(error_panel(video.name, str(exc)))
             return None
 
@@ -594,6 +612,9 @@ def process(video: Path, args) -> Path | None:
             state.current_label = (f"pantalla {index + 1} de {len(screens)}   ·   "
                                    f"{clock(first.start)} – {clock(last.end)}")
             state.reader.reset()
+            view.event("screen_start", index=index, span=span,
+                       start=first.start, end=last.end,
+                       frame=str(screens[index].frame))
 
         def on_delta(delta: str) -> None:
             state.reader.feed(delta)
@@ -627,6 +648,16 @@ def process(video: Path, args) -> Path | None:
                                         units_so_far, total_usage)
             if unit.error:
                 state.notes.append(f"{clock(unit.start)} sin analizar: {unit.error[:60]}")
+            view.event(
+                "screen_done", index=start, span=len(unit.screens),
+                start=unit.start, end=unit.end, title=unit.title,
+                frames=[str(s.frame) for s in unit.screens],
+                text=unit.chunk.get("texto_en_pantalla") or "",
+                elements=unit.chunk.get("elementos_ui") or [],
+                synthesis=unit.chunk.get("sintesis") or "",
+                merged=unit.merged, error=unit.error,
+                seconds=round(unit.usage.seconds, 2),
+                done=state.screens_done, total=state.screens_total)
             state.reader.reset()
 
         units = view.work(lambda: pipeline_mod.analyze(
@@ -643,7 +674,7 @@ def process(video: Path, args) -> Path | None:
         state.summary = run_summary(state, args.whisper, duration, len(raw_cuts),
                                     len(cuts), transcript, units, total_usage)
 
-        reporter = model
+        reporter, sin_sintesis = model, ""
         if args.reporter != args.vlm:
             # Dos pasos con nombre propio en vez de un "cambiando de modelo"
             # genérico: liberar 15 GB y cargar otros 16 son esperas distintas y
@@ -656,18 +687,20 @@ def process(video: Path, args) -> Path | None:
             size = model_size_gb(args.reporter)
             view.stage("redactar", f"cargando {state.writer_model}",
                        f"{size:.1f} GB desde disco" if size else "desde disco")
+            # Llegar hasta aquí y perderlo todo sería el peor desenlace: leer
+            # las pantallas es la parte cara y ya está hecha. Si el redactor no
+            # cabe o no carga, la corrida sigue y entrega lo leído sin síntesis.
             if aviso := check_headroom(args.reporter, size):
-                live.stop()
-                console.print(error_panel("memoria insuficiente", aviso))
-                return None
-
-            try:
-                reporter = view.work(lambda: VisionModel(args.reporter))
-            except ModelError as exc:
-                state.notes.append(f"no se pudo cargar {args.reporter}: {exc}")
-                live.stop()
-                console.print(error_panel(video.name, str(exc)))
-                return None
+                sin_sintesis = " ".join(aviso.split())
+                state.notes.append("sin memoria para el redactor · informe sin síntesis")
+                reporter = None
+            else:
+                try:
+                    reporter = view.work(lambda: VisionModel(args.reporter))
+                except ModelError as exc:
+                    sin_sintesis = f"No se pudo cargar {state.writer_model}: {exc}"
+                    state.notes.append("el redactor no cargó · informe sin síntesis")
+                    reporter = None
 
         state.current_label = ""
         state.screens_total = 0
@@ -690,10 +723,13 @@ def process(video: Path, args) -> Path | None:
                 state.detail = f"{len(units)} unidades"
             state.reader.feed(delta)
 
-        body, report_usage = view.work(lambda: write_report(
-            reporter, units, transcript, on_delta=on_report_delta))
+        if reporter is None:
+            body = fallback_body(units, sin_sintesis)
+        else:
+            body, report_usage = view.work(lambda: write_report(
+                reporter, units, transcript, on_delta=on_report_delta))
+            total_usage.add(report_usage)
         state.free_stream = False
-        total_usage.add(report_usage)
 
     elapsed = state.elapsed
     md_path = unique_path(DOWNLOADS, video.stem, "md")
@@ -708,9 +744,16 @@ def process(video: Path, args) -> Path | None:
                     body, total_usage),
         encoding="utf-8")
 
-    console.print(result_panel(video, md_path, json_path, frames_dir,
-                               units, duration, elapsed, body, total_usage))
-    console.print()
+    view.event("finished", markdown=str(md_path), json=str(json_path),
+               frames_dir=str(frames_dir), elapsed=round(elapsed, 1),
+               units=len(units), screens=sum(len(u.screens) for u in units),
+               prompt_tokens=total_usage.prompt_tokens,
+               generation_tokens=total_usage.generation_tokens,
+               peak_memory=round(total_usage.peak_memory, 1))
+    if not args.events:
+        console.print(result_panel(video, md_path, json_path, frames_dir,
+                                   units, duration, elapsed, body, total_usage))
+        console.print()
     return md_path
 
 
@@ -794,6 +837,10 @@ def main() -> int:
     parser.add_argument("--min-screen", type=float, default=MIN_SCREEN_SECONDS,
                         help="segundos que debe durar una pantalla para analizarse; "
                              "los tramos más breves se funden en la anterior")
+    parser.add_argument("--events", action="store_true",
+                        help="emite una línea JSON por evento en vez de la vista "
+                             "interactiva; para consumir la corrida desde otro "
+                             "programa")
     parser.add_argument("--ocr", choices=["modelo", "vision"], default="modelo",
                         help="quién transcribe la pantalla: el propio modelo, o "
                              "Vision, el OCR nativo de macOS (más rápido y "
@@ -803,9 +850,10 @@ def main() -> int:
     args = parser.parse_args()
 
     files = args.files
-    if not files:
-        intro(console)
-    console.print(welcome(args.vlm, args.reporter, args.whisper, console.width))
+    if not args.events:
+        if not files:
+            intro(console)
+        console.print(welcome(args.vlm, args.reporter, args.whisper, console.width))
 
     if not files:
         console.print(dropzone(console.width))
@@ -830,7 +878,7 @@ def main() -> int:
     if not ensure_models([args.vlm, args.reporter], console):
         return 1
 
-    interactive = console.is_terminal and not args.files
+    interactive = console.is_terminal and not args.files and not args.events
     done = failed = 0
     last_report: Path | None = None
 

@@ -289,24 +289,67 @@ def available_memory_gb() -> float:
     return pages * page / 1e9
 
 
-def check_headroom(model: str, needed_gb: float) -> str | None:
-    """Avisa si cargar este modelo dejaría la máquina sin memoria.
+def total_memory_gb() -> float:
+    """Memoria física de la máquina."""
+    import subprocess
+    try:
+        out = subprocess.run(["sysctl", "-n", "hw.memsize"],
+                             capture_output=True, text=True).stdout
+        return int(out.strip()) / 1e9
+    except Exception:  # noqa: BLE001
+        return float("inf")
 
-    Un modelo de dieciséis gigas en una máquina que no los tiene no da un error
-    limpio: el sistema entero se arrastra hasta congelarse y hay que reiniciar a
-    la fuerza. Y como otra corrida en paralelo aparece aquí como memoria ya
-    ocupada, esta sola comprobación cubre también el caso de dos instancias
-    peleándose por la RAM.
+
+def other_instances() -> int:
+    """Cuántas otras corridas de esta herramienta hay vivas.
+
+    Es el riesgo real, y el que se materializó: dos procesos pidiendo 21 GB cada
+    uno en una máquina de 48 dejaron el sistema colgado. La memoria libre del
+    momento no lo detecta a tiempo —cada proceso la reserva de a poco— pero
+    contar procesos sí.
+    """
+    import os
+    import subprocess
+    try:
+        out = subprocess.run(["pgrep", "-f", "transcribevideo"],
+                             capture_output=True, text=True).stdout
+    except Exception:  # noqa: BLE001
+        return 0
+    propios = {os.getpid(), os.getppid()}
+    return sum(1 for pid in out.split()
+               if pid.isdigit() and int(pid) not in propios)
+
+
+#: Memoria que se le deja al sistema operativo y al resto de aplicaciones.
+OS_RESERVE_GB = 8.0
+
+
+def check_headroom(model: str, needed_gb: float) -> str | None:
+    """Avisa si esta corrida dejaría la máquina sin memoria.
+
+    Se compara contra la memoria **física**, no contra la libre del momento.
+    Medir la libre parecía lo correcto y resultó demasiado nervioso: macOS
+    comprime y pagina, así que veinte gigas libres en una máquina de cuarenta y
+    ocho no significan que no quepa, y rechazar por eso degrada corridas que
+    habrían funcionado perfectamente.
+
+    Lo que sí es un riesgo real, porque ocurrió: dos corridas simultáneas
+    pidiendo veintiún gigas cada una dejaron el sistema colgado y hubo que
+    reiniciar a la fuerza. Eso se detecta contando procesos, no bytes libres.
     """
     if not needed_gb:
         return None
-    free = available_memory_gb()
-    # Margen sobre el peso del modelo: caché de KV, activaciones y el resto del
-    # proceso. Medido, una corrida con un modelo de 15.6 GB llega a 21 GB.
-    if free < needed_gb * 1.35:
-        return (f"Quedan {free:.1f} GB disponibles y {model.split('/')[-1]} "
-                f"necesita cerca de {needed_gb * 1.35:.0f} GB.\n"
-                "Cierra aplicaciones —u otra corrida de transcribevideo— antes "
-                "de seguir: si el sistema se queda sin memoria no falla, se "
-                "congela.")
+    necesita = needed_gb * 1.35
+
+    if (otras := other_instances()) > 0:
+        return (f"Ya hay {otras} corrida(s) de transcribevideo en marcha. "
+                f"Cada una usa cerca de {necesita:.0f} GB y dos a la vez no "
+                "caben: el sistema no falla, se congela. "
+                "Espera a que termine, o ciérrala.")
+
+    total = total_memory_gb()
+    if necesita > total - OS_RESERVE_GB:
+        return (f"{model.split('/')[-1]} necesita cerca de {necesita:.0f} GB y "
+                f"esta máquina tiene {total:.0f} GB en total. No alcanza: "
+                "prueba con un modelo más pequeño usando --vlm.")
     return None

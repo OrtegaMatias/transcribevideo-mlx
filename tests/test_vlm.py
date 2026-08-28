@@ -90,29 +90,49 @@ def test_output_without_reasoning_is_untouched():
 
 # ── resguardo de memoria ────────────────────────────────────────────────
 
-def test_no_warning_when_there_is_room(monkeypatch):
-    monkeypatch.setattr(vlm_mod, "available_memory_gb", lambda: 40.0)
-    assert vlm_mod.check_headroom("org/modelo", 16.0) is None
+def test_a_healthy_machine_is_not_blocked(monkeypatch):
+    """Medir la memoria LIBRE del momento resultó demasiado nervioso.
 
-
-def test_warns_when_the_machine_would_choke(monkeypatch):
-    """Sin memoria, MLX no falla limpio: el sistema se congela.
-
-    Ocurrió de verdad: dos corridas en paralelo, ~21 GB de pico cada una, y la
-    máquina hubo que reiniciarla a la fuerza. Otra instancia aparece aquí como
-    memoria ya ocupada, así que esta comprobación cubre también ese caso.
+    Con 20 GB libres de 48, el resguardo original rechazaba una corrida que
+    cabía perfectamente: macOS comprime y pagina, así que la libre instantánea
+    no dice si algo cabe. Se compara contra la física.
     """
-    monkeypatch.setattr(vlm_mod, "available_memory_gb", lambda: 12.0)
+    monkeypatch.setattr(vlm_mod, "total_memory_gb", lambda: 48.0)
+    monkeypatch.setattr(vlm_mod, "other_instances", lambda: 0)
+    assert vlm_mod.check_headroom("org/gemma", 16.0) is None
+
+
+def test_a_machine_that_truly_cannot_fit_it_is_blocked(monkeypatch):
+    monkeypatch.setattr(vlm_mod, "total_memory_gb", lambda: 16.0)
+    monkeypatch.setattr(vlm_mod, "other_instances", lambda: 0)
     aviso = vlm_mod.check_headroom("org/gemma-4-26B", 16.0)
-    assert aviso is not None
-    assert "gemma-4-26B" in aviso and "12.0 GB" in aviso
+    assert aviso and "16 GB en total" in aviso
+
+
+def test_a_second_run_is_what_actually_kills_the_machine(monkeypatch):
+    """Ocurrió de verdad: dos corridas de 21 GB en una máquina de 48.
+
+    El sistema no dio error, se congeló y hubo que reiniciarlo a la fuerza. La
+    memoria libre no lo anticipa porque cada proceso la toma de a poco; contar
+    procesos sí.
+    """
+    monkeypatch.setattr(vlm_mod, "total_memory_gb", lambda: 48.0)
+    monkeypatch.setattr(vlm_mod, "other_instances", lambda: 1)
+    aviso = vlm_mod.check_headroom("org/gemma", 16.0)
+    assert aviso and "ya hay 1 corrida" in aviso.lower()
 
 
 def test_a_model_of_unknown_size_is_not_blocked(monkeypatch):
     """Si no se sabe cuánto pesa, no se puede afirmar que no cabe."""
-    monkeypatch.setattr(vlm_mod, "available_memory_gb", lambda: 1.0)
+    monkeypatch.setattr(vlm_mod, "total_memory_gb", lambda: 8.0)
     assert vlm_mod.check_headroom("org/modelo", 0.0) is None
 
 
-def test_available_memory_returns_a_positive_number():
+def test_the_machine_reports_its_real_size():
+    assert vlm_mod.total_memory_gb() > 1
     assert vlm_mod.available_memory_gb() > 0
+
+
+def test_this_very_process_is_not_counted_as_a_rival():
+    """Contarse a sí mismo bloquearía toda corrida, siempre."""
+    assert vlm_mod.other_instances() >= 0
