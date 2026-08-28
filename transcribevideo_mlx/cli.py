@@ -620,8 +620,20 @@ def process(video: Path, args) -> Path | None:
                        start=first.start, end=last.end,
                        frame=str(screens[index].frame))
 
+        # Lo que el modelo escribe mientras analiza una pantalla, hacia afuera.
+        # Sin esto, quien consuma --events recibe la pantalla terminada de golpe
+        # y pasa varios segundos sin señal alguna. Se estrangula por tiempo: un
+        # evento por token serían miles de líneas y ninguna aportaría más que
+        # este resumen del campo en curso.
+        ultimo_delta = [0.0]
+
         def on_delta(delta: str) -> None:
             state.reader.feed(delta)
+            ahora = time.time()
+            if ahora - ultimo_delta[0] >= 0.25:
+                ultimo_delta[0] = ahora
+                view.event("reading", field=state.reader.field or "",
+                           text="\n".join(state.reader.lines(limit=12, width=90)))
             # El título aparece primero en el JSON: en cuanto se lee, la fila
             # activa deja de decir "leyendo…" y muestra de qué pantalla se trata.
             if state.reader.field == "titulo" and state.rows:
@@ -721,11 +733,18 @@ def process(video: Path, args) -> Path | None:
         view.stage("redactar", "leyendo las unidades",
                    f"contexto de ~{compact(contexto)} tokens")
 
+        ultimo_informe = [0.0]
+
         def on_report_delta(delta: str) -> None:
             if state.stage != "redactando el informe":
                 state.stage = "redactando el informe"
                 state.detail = f"{len(units)} unidades"
             state.reader.feed(delta)
+            ahora = time.time()
+            if ahora - ultimo_informe[0] >= 0.3:
+                ultimo_informe[0] = ahora
+                view.event("writing", phase=state.reader.phase,
+                           text="\n".join(state.reader.tail(limit=14, width=90)))
 
         if reporter is None:
             body = fallback_body(units, sin_sintesis)
