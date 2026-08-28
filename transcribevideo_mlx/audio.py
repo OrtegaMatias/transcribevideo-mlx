@@ -13,7 +13,9 @@ costar una sola llamada a un modelo.
 from __future__ import annotations
 
 import contextlib
+import io
 import os
+import re
 import subprocess
 import sys
 from dataclasses import dataclass
@@ -79,7 +81,7 @@ def has_audio(video: Path) -> bool:
 
 
 def transcribe(video: Path, model: str = "large-v3-turbo",
-               language: str | None = None) -> Transcript:
+               language: str | None = None, on_segment=None) -> Transcript:
     """Transcribe la pista de audio del video con MLX Whisper.
 
     Una grabación muda devuelve una transcripción vacía en vez de fallar: es un
@@ -91,10 +93,11 @@ def transcribe(video: Path, model: str = "large-v3-turbo",
 
     import mlx_whisper  # import perezoso: carga MLX, que tarda
 
-    kwargs: dict = {"path_or_hf_repo": MODELS[model], "verbose": False}
+    kwargs: dict = {"path_or_hf_repo": MODELS[model],
+                    "verbose": bool(on_segment)}
     if language:
         kwargs["language"] = language
-    with _muted():
+    with _captured(on_segment):
         result = mlx_whisper.transcribe(str(video), **kwargs)
 
     utterances = [
@@ -154,23 +157,54 @@ def snap_to_speech(cuts: list[float], transcript: Transcript,
     return snapped
 
 
-@contextlib.contextmanager
-def _muted():
-    """Silencia a Whisper mientras transcribe.
+_SEGMENT_RE = re.compile(r"^\[\d+:\d+\.\d+\s*-->\s*\d+:\d+\.\d+\]\s*(.+)$")
 
-    `verbose=False` no basta: la barra de tqdm y los avisos de detección de
-    idioma se escriben igual, y aparecen encima del panel vivo dejándolo
-    ilegible. Se redirigen los descriptores a nivel de proceso porque quien
-    escribe es una librería, no este código.
+
+class _LineSink(io.TextIOBase):
+    """Convierte lo que Whisper imprime en eventos de línea.
+
+    Whisper no ofrece ningún callback, pero con `verbose=True` va imprimiendo
+    cada segmento en cuanto lo decodifica. Interceptar esa salida es la única
+    forma de mostrar la transcripción apareciendo en vivo en vez de una barra
+    girando durante medio minuto.
+    """
+
+    def __init__(self, on_line):
+        self.on_line, self.buffer = on_line, ""
+
+    def write(self, chunk: str) -> int:
+        self.buffer += chunk
+        while "\n" in self.buffer:
+            line, self.buffer = self.buffer.split("\n", 1)
+            line = line.strip()
+            # La barra de tqdm sale por el mismo sitio y no es contenido.
+            if line and "%|" not in line and "frames/s" not in line:
+                match = _SEGMENT_RE.match(line)
+                self.on_line(match.group(1) if match else line)
+        return len(chunk)
+
+    def flush(self) -> None:
+        pass
+
+
+@contextlib.contextmanager
+def _captured(on_line=None):
+    """Redirige la salida de Whisper: a un sumidero, o a quien la quiera ver.
+
+    Sin `on_line` se descarta todo. `verbose=False` no bastaría: la barra de
+    tqdm y los avisos de idioma se escriben igual y aparecen encima del panel
+    vivo dejándolo ilegible. Se redirigen los descriptores a nivel de proceso
+    porque quien escribe es una librería, no este código.
     """
     saved_out, saved_err = sys.stdout, sys.stderr
-    devnull = open(os.devnull, "w")
-    sys.stdout = sys.stderr = devnull
+    sink = _LineSink(on_line) if on_line else open(os.devnull, "w")
+    sys.stdout = sys.stderr = sink
     try:
         yield
     finally:
         sys.stdout, sys.stderr = saved_out, saved_err
-        devnull.close()
+        if on_line is None:
+            sink.close()
 
 
 def _ts(seconds: float) -> str:

@@ -31,6 +31,29 @@ def test_escaped_quote_inside_a_string():
     assert parsed["n"] == 3
 
 
+def test_a_backslash_read_off_the_screen_does_not_lose_the_unit():
+    """El modelo copia lo que ve, y una barra invertida llega tal cual.
+
+    Visto en un video real: `Kids\\Proteger`. Para JSON es un escape inválido y
+    `json.loads` rechaza el objeto entero, así que se perdía la pantalla
+    completa por un carácter. Reintentar no sirve: a temperatura cero el modelo
+    devuelve lo mismo.
+    """
+    raw = '{"titulo": "Botones", "texto_en_pantalla": "Kids\\Proteger la batería"}'
+    assert _extract_json(raw)["texto_en_pantalla"] == "Kids\\Proteger la batería"
+
+
+def test_valid_escapes_survive_the_repair():
+    parsed = _extract_json(r'{"a": "linea1\nlinea2", "b": "dice \"hola\"", "c": "c:\\ruta"}')
+    assert parsed["a"] == "linea1\nlinea2"
+    assert parsed["b"] == 'dice "hola"'
+    assert parsed["c"] == "c:\\ruta"
+
+
+def test_unicode_escape_is_not_broken_by_the_repair():
+    assert _extract_json(r'{"a": "\u00f1andu"}')["a"] == "ñandu"
+
+
 @pytest.mark.parametrize("text", ["sin json aquí", "", '{"a": 1'])
 def test_unusable_output_raises(text):
     with pytest.raises(ValueError):

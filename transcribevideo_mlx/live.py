@@ -134,6 +134,39 @@ class FieldReader:
             return None
         return FIELD_LABELS.get(name, name)
 
+    @property
+    def phase(self) -> str:
+        """¿El modelo está razonando o ya escribiendo la respuesta?
+
+        Con razonamiento activo, el texto útil empieza después del cierre del
+        canal. Antes de eso lo que llega es la cadena de pensamiento, y vale la
+        pena mostrarla: es la parte más larga y la que explica por qué el
+        informe dice lo que dice.
+        """
+        from .vlm import REASONING_CLOSERS
+        return ("escribiendo"
+                if any(m in self.buffer for m in REASONING_CLOSERS)
+                else "razonando")
+
+    def tail(self, limit: int = 6, width: int = 60) -> list[str]:
+        """Últimas líneas del texto libre en curso (un informe, no un JSON)."""
+        from .vlm import REASONING_CLOSERS
+        text = self.buffer
+        cut = max((text.rfind(m) + len(m) for m in REASONING_CLOSERS if m in text),
+                  default=0)
+        text = text[cut:].lstrip("\n")
+        if not text:
+            # Aún razonando: se muestra el pensamiento, que es lo único que hay.
+            text = self.buffer
+        out: list[str] = []
+        for line in text.split("\n"):
+            line = line.rstrip()
+            while len(line) > width:
+                out.append(line[:width])
+                line = line[width:]
+            out.append(line)
+        return [line for line in out if line][-limit:]
+
     def lines(self, limit: int = 5, width: int = 60) -> list[str]:
         """Últimas líneas del valor en curso, ya legibles."""
         matches = list(_FIELD_RE.finditer(self.buffer))
@@ -196,6 +229,9 @@ class RunState:
 
     current_label: str = ""
     merging: int = 0
+    #: El informe final es Markdown, no JSON: se muestra como texto corrido y no
+    #: buscando campos que ahí no existen.
+    free_stream: bool = False
 
     prompt_tokens: int = 0
     generation_tokens: int = 0
@@ -394,20 +430,33 @@ def _stream(state: RunState, width: int, rows_visible: int) -> Panel:
             where.append(f"   ⇢ fusionando {state.merging}", style=WARN)
         rows += [where, Text()]
 
-    label = state.reader.label
-    if label:
-        reading = Text()
-        reading.append("leyendo ", style="grey42")
-        reading.append(label, style=f"bold {C2}")
-        rows += [reading, Text()]
-        lines = state.reader.lines(limit=max(3, rows_visible - 5), width=inner - 3)
+    def stream_lines(header: Text, lines: list[str], colour: str) -> None:
+        rows.extend([header, Text()])
         for i, line in enumerate(lines):
             body = Text(no_wrap=True)
             body.append("┃ ", style="grey30")
-            body.append(line, style="grey82")
+            body.append(line, style=colour)
             if i == len(lines) - 1 and state.frame // 5 % 2 == 0:
                 body.append(CURSOR, style=C1)
             rows.append(body)
+
+    label = state.reader.label
+    if state.free_stream and state.reader.buffer:
+        phase = state.reader.phase
+        header = Text()
+        header.append(phase, style=f"bold {C2 if phase == 'escribiendo' else WARN}")
+        header.append("   ", style="grey27")
+        header.append(f"{len(state.reader.buffer):,} caracteres", style="grey35")
+        stream_lines(header,
+                     state.reader.tail(limit=max(4, rows_visible - 3), width=inner - 3),
+                     "grey82" if phase == "escribiendo" else "grey54")
+    elif label:
+        reading = Text()
+        reading.append("leyendo ", style="grey42")
+        reading.append(label, style=f"bold {C2}")
+        stream_lines(reading,
+                     state.reader.lines(limit=max(3, rows_visible - 5), width=inner - 3),
+                     "grey82")
     elif not state.rows:
         waiting = Text(justify="center")
         waiting.append(state.detail or "trabajando", style="grey62")

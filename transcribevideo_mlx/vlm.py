@@ -205,6 +205,31 @@ def _strip_reasoning(text: str) -> str:
     return text[cut:].strip()
 
 
+#: Escapes que JSON acepta detrás de una contrabarra.
+_VALID_ESCAPES = set('"\\/bfnrtu')
+
+
+def _repair_escapes(chunk: str) -> str:
+    """Duplica las contrabarras que no inician un escape válido.
+
+    Transcribiendo una interfaz el modelo copia lo que ve, y una barra invertida
+    en pantalla llega tal cual: `Kids\\Proteger`. Para JSON eso es un escape
+    inválido y `json.loads` rechaza el objeto entero — se pierde la pantalla
+    completa por un carácter. Reintentar no ayuda: a temperatura cero el modelo
+    devuelve exactamente lo mismo. Hay que repararlo.
+    """
+    out, i = [], 0
+    while i < len(chunk):
+        char = chunk[i]
+        if char == "\\":
+            following = chunk[i + 1] if i + 1 < len(chunk) else ""
+            out.append("\\" if following in _VALID_ESCAPES else "\\\\")
+        else:
+            out.append(char)
+        i += 1
+    return "".join(out)
+
+
 def _extract_json(text: str) -> dict:
     """Recorta el primer objeto JSON balanceado del texto.
 
@@ -233,5 +258,9 @@ def _extract_json(text: str) -> dict:
         elif char == "}":
             depth -= 1
             if depth == 0:
-                return json.loads(text[start:i + 1])
+                candidate = text[start:i + 1]
+                try:
+                    return json.loads(candidate)
+                except json.JSONDecodeError:
+                    return json.loads(_repair_escapes(candidate))
     raise ValueError("objeto JSON incompleto")

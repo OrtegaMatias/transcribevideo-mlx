@@ -12,6 +12,7 @@ import argparse
 import os
 import shlex
 import shutil
+import subprocess
 import sys
 import threading
 import time
@@ -387,7 +388,8 @@ def error_panel(name: str, message: str) -> Panel:
                  title_align="left")
 
 
-def process(video: Path, args) -> bool:
+def process(video: Path, args) -> Path | None:
+    """Procesa un video. Devuelve la ruta del informe, o None si falló."""
     from . import audio as audio_mod
     from . import pipeline as pipeline_mod
     from . import segment as segment_mod
@@ -395,7 +397,7 @@ def process(video: Path, args) -> bool:
 
     if not video.exists():
         console.print(error_panel(video.name, f"No existe el archivo:\n{video}"))
-        return False
+        return None
 
     state = RunState(name=video.name,
                      reader_model=_short_model(args.vlm),
@@ -432,8 +434,12 @@ def process(video: Path, args) -> bool:
         # 2 · audio
         state.active_model = f"whisper {args.whisper}"
         view.stage("oír", "transcribiendo el audio", f"whisper {args.whisper}")
-        transcript = view.work(
-            lambda: audio_mod.transcribe(video, args.whisper, args.lang))
+        state.free_stream = True
+        transcript = view.work(lambda: audio_mod.transcribe(
+            video, args.whisper, args.lang,
+            on_segment=lambda line: state.reader.feed(line + "\n")))
+        state.free_stream = False
+        state.reader.reset()
         if transcript.utterances:
             state.detail = (f"{len(transcript.utterances)} segmentos · "
                             f"idioma {transcript.language}")
@@ -454,7 +460,7 @@ def process(video: Path, args) -> bool:
         if not screens:
             live.stop()
             console.print(error_panel(video.name, "No se pudo extraer ninguna pantalla."))
-            return False
+            return None
 
         if args.max_screens and len(screens) > args.max_screens:
             step = max(1, len(screens) // args.max_screens)
@@ -472,13 +478,18 @@ def process(video: Path, args) -> bool:
         except ModelError as exc:
             live.stop()
             console.print(error_panel(video.name, str(exc)))
-            return False
+            return None
 
         # 5 · analizar pantalla por pantalla
         state.screens_total = len(screens)
         state.rows = [ScreenRow(index=i, at=s.start) for i, s in enumerate(screens)]
         view.stage("leer", "leyendo las pantallas", f"{len(screens)} pantallas")
 
+        # Estos callbacks corren en el hilo trabajador: solo mutan estado, nunca
+        # dibujan. Quien dibuja es el bucle de `view.work`, en el hilo principal.
+        # Si dibujaran aquí, la vista se congelaría durante los prefill —cuando
+        # el modelo lee la imagen o las 43 unidades del informe y todavía no
+        # emite ningún token—, que es justo la espera más larga de cada llamada.
         def on_call(index: int, span: int) -> None:
             state.screens_done = index
             state.active = index
@@ -490,17 +501,15 @@ def process(video: Path, args) -> bool:
             state.current_label = (f"pantalla {index + 1} de {len(screens)}   ·   "
                                    f"{clock(first.start)} – {clock(last.end)}")
             state.reader.reset()
-            view.draw(force=True)
 
         def on_delta(delta: str) -> None:
             state.reader.feed(delta)
             # El título aparece primero en el JSON: en cuanto se lee, la fila
             # activa deja de decir "leyendo…" y muestra de qué pantalla se trata.
-            if state.reader.field == "titulo":
+            if state.reader.field == "titulo" and state.rows:
                 lines = state.reader.lines(limit=1, width=60)
                 if lines:
                     state.rows[state.active].title = lines[0]
-            view.draw()
 
         def on_unit(unit) -> None:
             state.record_unit(unit.usage.seconds)
@@ -520,13 +529,11 @@ def process(video: Path, args) -> bool:
             if unit.error:
                 state.notes.append(f"{clock(unit.start)} sin analizar: {unit.error[:60]}")
             state.reader.reset()
-            view.draw(force=True)
 
-        units = pipeline_mod.analyze(model, screens, transcript,
-                                     on_call=on_call, on_unit=on_unit,
-                                     on_delta=on_delta)
+        units = view.work(lambda: pipeline_mod.analyze(
+            model, screens, transcript,
+            on_call=on_call, on_unit=on_unit, on_delta=on_delta))
 
-        # 6 · informe
         # 6 · informe. La síntesis es una sola llamada y es la única etapa de
         # razonamiento de la corrida, así que puede permitirse un modelo más
         # capaz aunque sea lento. Los dos no caben en memoria a la vez.
@@ -545,18 +552,20 @@ def process(video: Path, args) -> bool:
                 state.notes.append(f"no se pudo cargar {args.reporter}: {exc}")
                 live.stop()
                 console.print(error_panel(video.name, str(exc)))
-                return False
+                return None
 
         state.current_label = ""
         state.screens_total = 0
         state.rows = []
         state.reader.reset()
+        state.free_stream = True     # el informe es Markdown, no JSON
         state.active_model = state.writer_model
         view.stage("redactar", "redactando el informe",
                    f"sintetizando {len(units)} unidades")
 
-        body, report_usage = write_report(reporter, units, transcript,
-                                          on_delta=on_delta)
+        body, report_usage = view.work(lambda: write_report(
+            reporter, units, transcript, on_delta=state.reader.feed))
+        state.free_stream = False
         total_usage.add(report_usage)
 
     elapsed = state.elapsed
@@ -575,7 +584,59 @@ def process(video: Path, args) -> bool:
     console.print(result_panel(video, md_path, json_path, frames_dir,
                                units, duration, elapsed, body, total_usage))
     console.print()
-    return True
+    return md_path
+
+
+def actions_bar(report: Path | None) -> Group:
+    """Qué se puede hacer al terminar, sin volver a arrancar el programa."""
+    bar = Text(justify="center")
+    if report:
+        bar.append("  Enter ", style=f"bold {OK}")
+        bar.append("abrir el informe", style="grey62")
+        bar.append("      ", style="grey27")
+    bar.append("  o ", style=f"bold {C1}")
+    bar.append("procesar otro video", style="grey62")
+    bar.append("      ", style="grey27")
+    bar.append("  q ", style="grey54")
+    bar.append("salir", style="grey62")
+    return Group(Align.center(Panel(bar, box=box.ROUNDED, border_style="grey30",
+                                    padding=(0, 2), width=card_width(console.width))),
+                 Text())
+
+
+def after_run(report: Path | None) -> list[str] | None:
+    """Menú posterior a una corrida.
+
+    Devuelve rutas nuevas si se pide procesar otro video, o None para salir.
+    Terminar y cerrarse deja al usuario con la terminal limpia y el informe
+    perdido en el scrollback; es más útil quedarse y ofrecer qué hacer.
+    """
+    while True:
+        console.print(actions_bar(report))
+        try:
+            choice = console.input("   ➜  ").strip().lower()
+        except (EOFError, KeyboardInterrupt):
+            console.print()
+            return None
+
+        if choice in ("q", "salir", "exit"):
+            return None
+        if choice in ("", "a", "abrir") and report:
+            subprocess.run(["open", str(report)], check=False)
+            continue
+        if choice in ("o", "otro"):
+            console.print(dropzone(console.width))
+            try:
+                files = shlex.split(console.input("   ➜  "))
+            except (EOFError, KeyboardInterrupt):
+                console.print()
+                return None
+            if files:
+                return files
+            continue
+        # Cualquier otra cosa que parezca una ruta se toma como el video.
+        if choice:
+            return shlex.split(choice)
 
 
 def main() -> int:
@@ -638,21 +699,43 @@ def main() -> int:
     if not ensure_models([args.vlm, args.reporter], console):
         return 1
 
-    ok = 0
-    for path in paths:
-        try:
-            ok += process(path, args)
-        except KeyboardInterrupt:
-            console.print()
-            console.print(error_panel(path.name, "Interrumpido."))
-            return 1
-        except Exception as exc:  # noqa: BLE001 - un video roto no tumba el lote
-            console.print(error_panel(path.name, f"{type(exc).__name__}: {exc}"))
+    interactive = console.is_terminal and not args.files
+    done = failed = 0
+    last_report: Path | None = None
 
-    if len(paths) > 1:
-        console.print(Align.center(
-            Text(f"listo · {ok}/{len(paths)} procesado(s)", style=DIM)))
-    return 0 if ok == len(paths) else 1
+    while paths:
+        for path in paths:
+            try:
+                report = process(path, args)
+            except KeyboardInterrupt:
+                console.print()
+                console.print(error_panel(path.name, "Interrumpido."))
+                return 1
+            except Exception as exc:  # noqa: BLE001 - un video roto no tumba el lote
+                console.print(error_panel(path.name, f"{type(exc).__name__}: {exc}"))
+                report = None
+            if report:
+                done += 1
+                last_report = report
+            else:
+                failed += 1
+
+        if len(paths) > 1:
+            console.print(Align.center(
+                Text(f"listo · {done} procesado(s), {failed} con problema",
+                     style=DIM)))
+
+        # Al terminar no se cierra: queda a la vista qué salió y qué se puede
+        # hacer con ello. Sin terminal (salida redirigida) no hay a quién
+        # preguntarle, así que se sale como cualquier comando.
+        if not interactive:
+            break
+        siguiente = after_run(last_report)
+        if not siguiente:
+            break
+        paths = [Path(os.path.expanduser(f)).resolve() for f in siguiente if f.strip()]
+
+    return 0 if failed == 0 else 1
 
 
 if __name__ == "__main__":
