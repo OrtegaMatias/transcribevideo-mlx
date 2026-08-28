@@ -41,7 +41,11 @@ bloques de código, con exactamente estas claves:
 
 Reglas:
 
-- "titulo": nombre corto de la pantalla, tal como aparece en ella si es posible.
+- "titulo": nombre corto de la pantalla. Usa el que aparece escrito en ella si \
+lo hay. Si no lo hay —un diálogo, un menú emergente, una pantalla sin texto— \
+descríbela en dos a cuatro palabras: "Diálogo de permisos", "Menú emergente", \
+"Fondo sin texto". NUNCA dejes este campo vacío: es lo que identifica la \
+pantalla en el informe y en la línea de tiempo.
 - "texto_en_pantalla": SOLO texto que puedas LEER literalmente en las imágenes. \
 Transcríbelo respetando etiquetas y valores. Si algo se menciona en el audio \
 pero NO está escrito en la imagen, NO lo incluyas. No completes, no infieras, \

@@ -104,6 +104,24 @@ def test_progress_callbacks_report_merges():
     assert spans == [1, 2]
 
 
+def test_title_falls_back_to_what_was_read():
+    """Una pantalla sin título visible no puede quedarse sin nombre.
+
+    Un diálogo de permisos no tiene barra de título, y el modelo tiende a dejar
+    el campo vacío; entonces la línea de tiempo se llena de "(sin título)", que
+    no identifica nada. La primera línea de lo leído casi siempre sirve.
+    """
+    from transcribevideo_mlx.pipeline import Unit
+    screen = screens(1)
+    assert Unit(0, screen, 0, 5, {"titulo": "Ajustes"}).title == "Ajustes"
+    assert Unit(0, screen, 0, 5,
+                {"titulo": "", "texto_en_pantalla": "¿Permitir acceso?\nSí\nNo"}
+                ).title == "¿Permitir acceso?"
+    assert Unit(0, screen, 0, 5,
+                {"titulo": "", "texto_en_pantalla": ""}).title == "pantalla sin texto"
+    assert Unit(0, screen, 0, 5, {}).title == "pantalla sin texto"
+
+
 def test_usage_is_recorded_per_unit():
     model = FakeModel({1: True})
     units = analyze(model, screens(3), transcript())

@@ -241,6 +241,11 @@ class RunState:
     #: Segundos que tomó cada unidad ya terminada, para estimar lo que falta.
     unit_times: list[float] = field(default_factory=list)
 
+    #: Resumen maestro de la corrida: [(sección, [(etiqueta, valor)])]. Ocupa la
+    #: columna izquierda cuando ya no hay cola de pantallas que mostrar —
+    #: durante el informe, que es la espera más larga— con datos que hasta ahora
+    #: solo existían en el JSON.
+    summary: list = field(default_factory=list)
     notes: list[str] = field(default_factory=list)
 
     reader: FieldReader = field(default_factory=FieldReader)
@@ -382,6 +387,28 @@ def _header(state: RunState) -> Panel:
     top.add_row(title, right)
     return Panel(Group(top, Text(), breadcrumb(state)), box=box.ROUNDED,
                  border_style="grey27", padding=(0, 2))
+
+
+def _summary(state: RunState, width: int) -> Panel:
+    """Resumen maestro de la corrida, para la columna izquierda.
+
+    Se muestra cuando ya no hay cola de pantallas: durante el informe, que es la
+    espera larga de la corrida. Son cifras que existían solo en el JSON y que
+    nadie miraba mientras esperaba.
+    """
+    rows: list[RenderableType] = []
+    for section, items in state.summary:
+        if rows:
+            rows.append(Text())
+        rows.append(Text(section.upper(), style=f"bold {C2}"))
+        for label, value in items:
+            line = Text(no_wrap=True)
+            line.append(f"  {label:<14}", style="grey42")
+            line.append(str(value)[:max(6, width - 22)], style="grey78")
+            rows.append(line)
+    return Panel(Group(*rows) if rows else Text("—", style="grey27"),
+                 box=box.ROUNDED, border_style="grey27", padding=(1, 2),
+                 title=Text(" resumen ", style="grey42"), title_align="left")
 
 
 def _queue(state: RunState, width: int, rows_visible: int) -> Panel:
@@ -532,8 +559,13 @@ def render(state: RunState, width: int, height: int = 30) -> Layout:
         Layout(name="body", ratio=1),
         Layout(_footer(state, width), name="foot", size=footer_height),
     )
+    # Mientras hay cola de pantallas, la izquierda es el trabajo. Cuando ya no
+    # la hay —durante el informe, la espera más larga— pasa a ser el resumen de
+    # la corrida, en vez de un recuadro vacío.
+    izquierda = (_queue(state, left, rows_visible) if state.rows
+                 else _summary(state, left))
     layout["body"].split_row(
-        Layout(_queue(state, left, rows_visible), name="queue", size=left),
+        Layout(izquierda, name="queue", size=left),
         Layout(_stream(state, right, rows_visible), name="stream", ratio=1),
     )
     return layout

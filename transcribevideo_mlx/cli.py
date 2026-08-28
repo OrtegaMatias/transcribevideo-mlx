@@ -388,6 +388,43 @@ def error_panel(name: str, message: str) -> Panel:
                  title_align="left")
 
 
+def context_tokens(units, transcript) -> int:
+    """Tamaño aproximado del prompt del informe, en tokens.
+
+    Es una estimación por caracteres, no un conteo real: sirve para decirle al
+    usuario por qué el primer token tarda, no para presupuestar.
+    """
+    chars = sum(len(str(u.chunk)) for u in units) + len(transcript.full_text)
+    return chars // 4
+
+
+def run_summary(state: RunState, whisper: str, duration: float, raw_cuts: int,
+                cuts: int, transcript, units, usage: Usage) -> list:
+    """Las cifras de la corrida, para la columna izquierda durante el informe."""
+    merges = sum(1 for u in units if u.merged)
+    errors = sum(1 for u in units if u.error)
+    per_screen = (sum(state.unit_times) / len(state.unit_times)
+                  if state.unit_times else 0.0)
+    words = len(transcript.full_text.split())
+    return [
+        ("video", [("duración", clock(duration)),
+                   ("pantallas", f"{raw_cuts} → {cuts}"),
+                   ("fundidas", raw_cuts - cuts)]),
+        ("audio", [("idioma", transcript.language),
+                   ("segmentos", len(transcript.utterances)),
+                   ("palabras", f"{words:,}".replace(",", "."))]),
+        ("lectura", [("unidades", len(units)),
+                     ("fusiones", merges),
+                     ("errores", errors),
+                     ("por pantalla", f"{per_screen:.1f} s"),
+                     ("tokens", f"{compact(usage.prompt_tokens)} / "
+                                f"{compact(usage.generation_tokens)}")]),
+        ("modelos", [("lee", state.reader_model),
+                     ("redacta", state.writer_model),
+                     ("oye", whisper)]),
+    ]
+
+
 def process(video: Path, args) -> Path | None:
     """Procesa un video. Devuelve la ruta del informe, o None si falló."""
     from . import audio as audio_mod
@@ -433,11 +470,20 @@ def process(video: Path, args) -> Path | None:
 
         # 2 · audio
         state.active_model = f"whisper {args.whisper}"
-        view.stage("oír", "transcribiendo el audio", f"whisper {args.whisper}")
+        # Antes de transcribir hay que cargar el modelo, y eso tarda. Decir
+        # "transcribiendo" mientras todavía carga es mentir sobre en qué se está
+        # yendo el tiempo; la etiqueta cambia sola con el primer segmento.
+        view.stage("oír", "cargando whisper", args.whisper)
         state.free_stream = True
+
+        def on_segment(line: str) -> None:
+            if state.stage != "transcribiendo el audio":
+                state.stage = "transcribiendo el audio"
+                state.detail = args.whisper
+            state.reader.feed(line + "\n")
+
         transcript = view.work(lambda: audio_mod.transcribe(
-            video, args.whisper, args.lang,
-            on_segment=lambda line: state.reader.feed(line + "\n")))
+            video, args.whisper, args.lang, on_segment=on_segment))
         state.free_stream = False
         state.reader.reset()
         if transcript.utterances:
@@ -537,17 +583,27 @@ def process(video: Path, args) -> Path | None:
         # 6 · informe. La síntesis es una sola llamada y es la única etapa de
         # razonamiento de la corrida, así que puede permitirse un modelo más
         # capaz aunque sea lento. Los dos no caben en memoria a la vez.
+        state.rows = []
+        state.screens_total = 0
+        state.reader.reset()
+        state.summary = run_summary(state, args.whisper, duration, len(raw_cuts),
+                                    len(cuts), transcript, units, total_usage)
+
         reporter = model
         if args.reporter != args.vlm:
-            state.rows = []
-            state.screens_total = 0
-            state.reader.reset()
+            # Dos pasos con nombre propio en vez de un "cambiando de modelo"
+            # genérico: liberar 15 GB y cargar otros 16 son esperas distintas y
+            # conviene ver en cuál se está.
             state.active_model = state.writer_model
-            view.stage("redactar", "cambiando al modelo de síntesis",
-                       f"{state.reader_model} → {state.writer_model}")
+            view.stage("redactar", f"liberando {state.reader_model}",
+                       "los dos modelos no caben en memoria")
+            view.work(model.release)
+
+            size = model_size_gb(args.reporter)
+            view.stage("redactar", f"cargando {state.writer_model}",
+                       f"{size:.1f} GB desde disco" if size else "desde disco")
             try:
-                reporter = view.work(lambda: (model.release(),
-                                              VisionModel(args.reporter))[1])
+                reporter = view.work(lambda: VisionModel(args.reporter))
             except ModelError as exc:
                 state.notes.append(f"no se pudo cargar {args.reporter}: {exc}")
                 live.stop()
@@ -560,11 +616,23 @@ def process(video: Path, args) -> Path | None:
         state.reader.reset()
         state.free_stream = True     # el informe es Markdown, no JSON
         state.active_model = state.writer_model
-        view.stage("redactar", "redactando el informe",
-                   f"sintetizando {len(units)} unidades")
+        state.summary = run_summary(state, args.whisper, duration, len(raw_cuts),
+                                    len(cuts), transcript, units, total_usage)
+
+        # El prefill del informe son decenas de miles de tokens y durante ese
+        # rato no llega ninguno: decir cuántos son evita que parezca detenido.
+        contexto = context_tokens(units, transcript)
+        view.stage("redactar", "leyendo las unidades",
+                   f"contexto de ~{compact(contexto)} tokens")
+
+        def on_report_delta(delta: str) -> None:
+            if state.stage != "redactando el informe":
+                state.stage = "redactando el informe"
+                state.detail = f"{len(units)} unidades"
+            state.reader.feed(delta)
 
         body, report_usage = view.work(lambda: write_report(
-            reporter, units, transcript, on_delta=state.reader.feed))
+            reporter, units, transcript, on_delta=on_report_delta))
         state.free_stream = False
         total_usage.add(report_usage)
 

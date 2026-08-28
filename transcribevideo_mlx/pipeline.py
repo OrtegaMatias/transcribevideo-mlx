@@ -53,7 +53,20 @@ class Unit:
 
     @property
     def title(self) -> str:
-        return (self.chunk.get("titulo") or "").strip() or "(sin título)"
+        """Nombre de la unidad, con respaldo si el modelo no puso ninguno.
+
+        El prompt exige un título siempre, pero una pantalla sin texto visible
+        sigue tentando al modelo a dejarlo vacío. Antes de rendirse a un
+        "(sin título)" que no dice nada, se usa la primera línea de lo que se
+        leyó, que casi siempre identifica la pantalla igual de bien.
+        """
+        if titulo := (self.chunk.get("titulo") or "").strip():
+            return titulo
+        screen_text = (self.chunk.get("texto_en_pantalla") or "").strip()
+        if first_line := next((l.strip() for l in screen_text.splitlines()
+                               if l.strip()), ""):
+            return first_line[:60]
+        return "pantalla sin texto"
 
 
 def analyze(model: VisionModel, screens: list[Screen], transcript: Transcript,
