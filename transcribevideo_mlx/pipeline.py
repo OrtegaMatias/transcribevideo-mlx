@@ -23,7 +23,8 @@ from dataclasses import dataclass, field
 from typing import Callable
 
 from .audio import Transcript
-from .prompts import CHUNK_SYSTEM, chunk_user_prompt
+from .prompts import (CHUNK_SYSTEM, CHUNK_SYSTEM_OCR, chunk_user_prompt,
+                      chunk_user_prompt_ocr)
 from .segment import Screen
 from .vlm import ModelError, Usage, VisionModel
 
@@ -44,6 +45,9 @@ class Unit:
     end: float
     chunk: dict = field(default_factory=dict)
     usage: Usage = field(default_factory=Usage)
+    #: Segundos que costó el OCR nativo, cuando se usa. Se lleva aparte
+    #: porque no es tiempo de modelo y mezclarlo escondería la comparación.
+    ocr_seconds: float = 0.0
     link_pending: bool = False
     error: str | None = None
 
@@ -72,7 +76,8 @@ class Unit:
 def analyze(model: VisionModel, screens: list[Screen], transcript: Transcript,
             on_call: Callable[[int, int], None] | None = None,
             on_unit: Callable[[Unit], None] | None = None,
-            on_delta: Callable[[str], None] | None = None) -> list[Unit]:
+            on_delta: Callable[[str], None] | None = None,
+            use_ocr: bool = False) -> list[Unit]:
     """Convierte las pantallas en unidades de información.
 
     `on_call` se invoca antes de cada llamada al modelo con (pantalla_inicial,
@@ -95,7 +100,8 @@ def analyze(model: VisionModel, screens: list[Screen], transcript: Transcript,
             if on_call:
                 on_call(start_index, span)
 
-            unit = _analyze_group(model, len(units), group, transcript, on_delta)
+            unit = _analyze_group(model, len(units), group, transcript,
+                                  on_delta, use_ocr)
             spent.add(unit.usage)
 
             complete = bool(unit.chunk.get("se_entiende_sola", True))
@@ -120,11 +126,12 @@ def analyze(model: VisionModel, screens: list[Screen], transcript: Transcript,
 
 def _analyze_group(model: VisionModel, index: int, group: list[Screen],
                    transcript: Transcript,
-                   on_delta: Callable[[str], None] | None = None) -> Unit:
+                   on_delta: Callable[[str], None] | None = None,
+                   use_ocr: bool = False) -> Unit:
     start, end = group[0].start, group[-1].end
     unit = Unit(index=index, screens=list(group), start=start, end=end)
 
-    prompt = chunk_user_prompt(
+    ventana = dict(
         window_label=f"{_ts(start)} → {_ts(end)}",
         window_audio=transcript.stamped_between(start, end),
         previous_tail=transcript.stamped_between(
@@ -133,9 +140,28 @@ def _analyze_group(model: VisionModel, index: int, group: list[Screen],
         n_screens=len(group),
     )
 
+    screen_text = ""
+    if use_ocr:
+        import time as _time
+
+        from . import ocr
+        t0 = _time.time()
+        screen_text = ocr.read_screens([s.frame for s in group])
+        unit.ocr_seconds = _time.time() - t0
+        system = CHUNK_SYSTEM_OCR
+        prompt = chunk_user_prompt_ocr(screen_text=screen_text, **ventana)
+    else:
+        system = CHUNK_SYSTEM
+        prompt = chunk_user_prompt(**ventana)
+
     try:
         unit.chunk, unit.usage = model.analyze_screen(
-            CHUNK_SYSTEM, prompt, [s.frame for s in group], on_delta)
+            system, prompt, [s.frame for s in group], on_delta)
+        if use_ocr:
+            # El texto literal lo pone el OCR, no el modelo: así el campo lo
+            # genera algo que nunca oyó el audio y la contaminación deja de ser
+            # posible por construcción, no solo improbable por prompt.
+            unit.chunk["texto_en_pantalla"] = screen_text
     except ModelError as exc:
         # Un tramo ilegible no debe costar la corrida entera: se marca y el
         # informe final lo verá como un hueco declarado.

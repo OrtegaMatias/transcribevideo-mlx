@@ -611,7 +611,8 @@ def process(video: Path, args) -> Path | None:
 
         units = view.work(lambda: pipeline_mod.analyze(
             model, screens, transcript,
-            on_call=on_call, on_unit=on_unit, on_delta=on_delta))
+            on_call=on_call, on_unit=on_unit, on_delta=on_delta,
+            use_ocr=args.ocr == "vision"))
 
         # 6 · informe. La síntesis es una sola llamada y es la única etapa de
         # razonamiento de la corrida, así que puede permitirse un modelo más
@@ -773,6 +774,10 @@ def main() -> int:
     parser.add_argument("--min-screen", type=float, default=MIN_SCREEN_SECONDS,
                         help="segundos que debe durar una pantalla para analizarse; "
                              "los tramos más breves se funden en la anterior")
+    parser.add_argument("--ocr", choices=["modelo", "vision"], default="modelo",
+                        help="quién transcribe la pantalla: el propio modelo, o "
+                             "Vision, el OCR nativo de macOS (más rápido y "
+                             "literal; el modelo solo interpreta)")
     parser.add_argument("--max-screens", type=int, default=0,
                         help="tope de pantallas a analizar (0 = sin tope)")
     args = parser.parse_args()

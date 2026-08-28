@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "transcribevideo-mlx"
-version = "0.4.1"
+version = "0.5.0"
 description = "Turn a screen recording into a report: local vision + speech on Apple Silicon, cross-referencing what's on screen with what's being said."
 readme = "README.md"
 requires-python = ">=3.10"
@@ -28,6 +28,8 @@ dependencies = [
   "mlx-vlm>=0.6.17",
   "mlx-whisper>=0.4",
   "jinja2>=3.1",
+  "pyobjc-framework-Vision>=10.0",
+  "pyobjc-framework-Quartz>=10.0",
   "rich>=13.0",
   "pyfiglet>=1.0",
 ]

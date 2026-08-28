@@ -99,6 +99,7 @@ def render_json(video: Path, units: list[Unit], transcript: Transcript,
                 "error": unit.error,
                 "frames": [str(s.frame) for s in unit.screens],
                 "usage": asdict(unit.usage),
+                "ocr_seconds": unit.ocr_seconds,
                 "chunk": unit.chunk,
             }
             for unit in units

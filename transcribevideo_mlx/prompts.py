@@ -134,3 +134,75 @@ def report_user_prompt(chunks_block: str, transcript: str) -> str:
         "=== TRANSCRIPCIÓN COMPLETA DEL AUDIO ===\n"
         f"{transcript}\n\n"
         "Redacta el informe.")
+
+
+CHUNK_SYSTEM_OCR = """\
+Analizas una grabación de pantalla. Recibes una o más capturas de la pantalla, \
+el texto que un OCR ya extrajo de ellas, y la transcripción de lo que el \
+narrador dijo mientras esas pantallas estaban visibles.
+
+NO transcribas la pantalla: eso ya está hecho y te lo entregan. Tu trabajo es \
+interpretar.
+
+Devuelves EXCLUSIVAMENTE un objeto JSON válido, sin texto antes ni después, sin \
+bloques de código, con exactamente estas claves:
+
+{
+  "titulo": string,
+  "elementos_ui": [string],
+  "sintesis": string,
+  "se_entiende_sola": boolean,
+  "motivo": string
+}
+
+Reglas:
+
+- "titulo": nombre corto de la pantalla. Usa el que aparece escrito en ella si \
+lo hay. Si no lo hay —un diálogo, un menú emergente, una pantalla sin texto— \
+descríbela en dos a cuatro palabras. NUNCA lo dejes vacío.
+- "elementos_ui": COMO MÁXIMO 5 elementos, los más relevantes. Prioriza los que \
+NO tienen texto legible (iconos, casillas, interruptores, controles), porque el \
+texto ya viene del OCR y sería redundante. Nómbralos en dos o tres palabras.
+- "sintesis": qué se está haciendo o explicando aquí, cruzando lo que se ve con \
+lo que se dice. UNA sola frase.
+- "se_entiende_sola": true si este tramo forma una unidad comprensible por sí \
+misma. Responde false SOLO si una oración o un procedimiento queda literalmente \
+truncado y se completa en el tramo siguiente. Ante la duda, true.
+- "motivo": por qué. COMO MÁXIMO 8 palabras.
+
+El texto del OCR puede traer ruido: fragmentos sin sentido salidos de iconos o \
+bordes. Ignóralos al interpretar; no los corrijas ni los comentes.
+
+No expliques nada fuera del JSON. Responde en el mismo idioma del audio."""
+
+
+def chunk_user_prompt_ocr(window_label: str, window_audio: str,
+                          previous_tail: str, next_head: str,
+                          n_screens: int, screen_text: str) -> str:
+    """Prompt del analizador cuando el texto de pantalla ya viene extraído."""
+    plural = "las pantallas" if n_screens > 1 else "la pantalla"
+    parts = []
+
+    if previous_tail:
+        parts.append(
+            "CONTEXTO PREVIO (no lo analices; úsalo solo para juzgar continuidad):\n"
+            f"{previous_tail}")
+
+    parts.append(
+        "=== TEXTO YA EXTRAÍDO DE LA PANTALLA (no lo repitas) ===\n"
+        f"{screen_text or '(la pantalla no tiene texto legible)'}\n"
+        "=== FIN DEL TEXTO ===")
+
+    parts.append(
+        f"=== AUDIO DE ESTE TRAMO ({window_label}) ===\n"
+        f"{window_audio or '(sin habla en este tramo)'}\n"
+        "=== FIN DEL TRAMO ===")
+
+    if next_head:
+        parts.append(
+            "CONTEXTO SIGUIENTE (no lo analices; úsalo solo para juzgar continuidad):\n"
+            f"{next_head}")
+
+    parts.append(
+        f"Interpreta {plural} adjunta{'s' if n_screens > 1 else ''} y devuelve el JSON.")
+    return "\n\n".join(parts)
