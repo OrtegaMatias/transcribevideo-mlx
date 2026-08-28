@@ -84,6 +84,13 @@ uv tool install git+https://github.com/OrtegaMatias/transcribevideo-mlx
 # or: pipx install git+https://github.com/OrtegaMatias/transcribevideo-mlx
 ```
 
+To upgrade, pass `--force` — without it `uv` sees the tool is already installed and
+does nothing, even when the code has moved on:
+
+```bash
+uv tool install --force git+https://github.com/OrtegaMatias/transcribevideo-mlx
+```
+
 The first run downloads the two models (~32 GB total, cached afterwards). Anything
 you already have through LM Studio is picked up from `~/.lmstudio/models` instead of
 being downloaded again. To run with a single model, point `--reporter` at the same id

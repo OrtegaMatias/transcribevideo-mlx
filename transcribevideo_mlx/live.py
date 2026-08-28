@@ -180,6 +180,9 @@ class RunState:
     stage_key: str = "segmentar"
     detail: str = ""
     started: float = field(default_factory=time.time)
+    #: Cuándo empezó la etapa actual. Un reloj propio es lo que distingue
+    #: "cargando 16 GB" de "colgado".
+    stage_started: float = field(default_factory=time.time)
 
     reader_model: str = ""
     writer_model: str = ""
@@ -210,6 +213,10 @@ class RunState:
     @property
     def elapsed(self) -> float:
         return time.time() - self.started
+
+    @property
+    def stage_elapsed(self) -> float:
+        return time.time() - self.stage_started
 
     @property
     def stage_index(self) -> int:
@@ -402,8 +409,12 @@ def _stream(state: RunState, width: int, rows_visible: int) -> Panel:
                 body.append(CURSOR, style=C1)
             rows.append(body)
     elif not state.rows:
-        rows += [Text(), Align.center(pulse(state.frame, min(inner, 46))), Text(),
-                 Align.center(Text(state.detail or "trabajando…", style="grey42"))]
+        waiting = Text(justify="center")
+        waiting.append(state.detail or "trabajando", style="grey62")
+        waiting.append("   ", style="grey27")
+        waiting.append(human(state.stage_elapsed), style="grey35")
+        rows += [Text(), Align.center(pulse(state.frame, min(inner, 46))),
+                 Text(), waiting]
     else:
         rows.append(Text("esperando al modelo…", style="grey30"))
 

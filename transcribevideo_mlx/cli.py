@@ -11,8 +11,11 @@ from __future__ import annotations
 import argparse
 import os
 import shlex
+import shutil
 import sys
+import threading
 import time
+import warnings
 from pathlib import Path
 
 from rich import box
@@ -21,6 +24,7 @@ from rich.console import Console, Group
 from rich.live import Live
 from rich.panel import Panel
 from rich.rule import Rule
+from rich.table import Table
 from rich.text import Text
 
 try:
@@ -31,7 +35,7 @@ except Exception:  # noqa: BLE001 - el wordmark es decorativo
 from . import __version__
 from .audio import MODELS, snap_to_speech
 from .live import (C1, C2, DIM, ERR, OK, WARN, RunState, ScreenRow, clock,
-                   compact, gradient, human, render)
+                   compact, gradient, human, interp, render)
 from .report import render_json, render_markdown, unique_path, write_report
 from .segment import CUT_THRESHOLD, MIN_SCREEN_SECONDS, SAMPLE_FPS
 from .vlm import DEFAULT_MODEL, DEFAULT_REPORTER, Usage, resolve_model_path
@@ -44,22 +48,208 @@ REDRAW_INTERVAL = 0.08
 console = Console(file=sys.stdout, highlight=False)
 
 
-def banner(vlm: str, reporter: str, whisper: str) -> Group:
-    motif = "▚▚▖▘▝▗▚▘▖▝▚▗▘▚▖▝▘▗▚▖▘"
-    word = pyfiglet.figlet_format("transcribevideo", font="small") if pyfiglet else "transcribevideo"
-    sub = Text("local · mlx · visión + audio · apple silicon", style=DIM, justify="center")
+MOTIF = "▚▚▖▘▝▗▚▘▖▝▚▗▘▚▖▝▘▗▚▖▘"
+FORMATS = "mp4 · mov · m4v · mkv · webm"
 
-    def short(name: str) -> str:
-        return name.split("/")[-1].replace("-it-QAT", "").replace("-MLX-4bit", "")
 
-    cfg = Text(justify="center")
-    cfg.append("lee ", style="grey42"); cfg.append(short(vlm), style="grey70")
-    cfg.append("   ·   ", style="grey30")
-    cfg.append("redacta ", style="grey42"); cfg.append(short(reporter), style="grey70")
-    cfg.append("   ·   ", style="grey30")
-    cfg.append("oye ", style="grey42"); cfg.append(whisper, style="grey70")
-    return Group(Text(), Align.center(gradient(motif)), Align.center(gradient(word)),
-                 sub, Text(), cfg, Text())
+def wordmark() -> str:
+    """El logotipo, sin las filas vacías que deja pyfiglet.
+
+    La última fila suele venir llena de espacios, no vacía, así que un
+    `rstrip("\\n")` no la quita y el logo queda flotando.
+    """
+    raw = (pyfiglet.figlet_format("transcribevideo", font="small") if pyfiglet
+           else "transcribevideo")
+    lines = raw.split("\n")
+    while lines and not lines[-1].strip():
+        lines.pop()
+    return "\n".join(lines)
+
+
+def sweep(word: str, t: float) -> Text:
+    """El wordmark con un brillo que lo recorre.
+
+    Sirve para la entrada animada: el degradado base se mantiene y solo se
+    realza una banda estrecha que viaja, así el arranque tiene vida sin que el
+    resultado final cambie de aspecto.
+    """
+    lines = word.rstrip("\n").split("\n")
+    width = max((len(line) for line in lines), default=1) or 1
+    head = t * (width + 16) - 8
+    out = Text()
+    for line in lines:
+        for i, char in enumerate(line):
+            pos = i / (width - 1) if width > 1 else 0.0
+            near = max(0.0, 1.0 - abs(i - head) / 7.0)
+            colour = interp(interp(C1, C2, pos), "#FFFFFF", near * 0.75)
+            out.append(char, style=colour + (" bold" if near > 0.5 else ""))
+        out.append("\n")
+    return out
+
+
+def intro(console_: Console) -> None:
+    """Barrido de bienvenida. Solo si hay terminal; dura menos de un segundo."""
+    if not console_.is_terminal:
+        return
+    word = wordmark()
+    with Live(console=console_, refresh_per_second=30, transient=True) as live:
+        for step in range(22):
+            live.update(Group(Text(), Align.center(gradient(MOTIF)),
+                              Align.center(sweep(word, step / 21))))
+            time.sleep(0.028)
+
+
+def _hf_cache(model: str) -> Path | None:
+    """Carpeta del modelo en la caché de Hugging Face, si está descargado."""
+    cache = Path.home() / ".cache" / "huggingface" / "hub"
+    folder = cache / ("models--" + model.replace("/", "--"))
+    return folder if folder.is_dir() else None
+
+
+def _model_status(model: str) -> tuple[bool, float]:
+    """¿Está ya en disco, y cuánto pesa?
+
+    Se miran los dos sitios donde puede estar: la carpeta de LM Studio, que es
+    de donde lo toma `resolve_model_path`, y la caché de Hugging Face, que es
+    donde cae si lo descargó esta herramienta.
+    """
+    path = Path(resolve_model_path(model))
+    if not path.is_dir():
+        cached = _hf_cache(model)
+        if cached is None:
+            return False, 0.0
+        weights = list(cached.rglob("*.safetensors")) + list(cached.rglob("*.gguf"))
+        return True, sum(f.stat().st_size for f in weights if f.is_file()) / 1e9
+    weights = list(path.glob("*.safetensors")) or list(path.glob("*.gguf"))
+    return True, sum(f.stat().st_size for f in weights) / 1e9
+
+
+def ensure_models(models: list[str], console_: Console) -> bool:
+    """Descarga lo que falte antes de entrar a la vista de pantalla completa.
+
+    `mlx_vlm.load` descargaría igual, pero lo haría ya dentro del TUI, donde las
+    barras de progreso de Hugging Face quedan ocultas o rompen el panel. Bajar
+    dieciséis gigas sin ninguna señal es indistinguible de un cuelgue, así que
+    esto se hace afuera y con su progreso a la vista.
+    """
+    missing = [m for m in dict.fromkeys(models) if not _model_status(m)[0]]
+    if not missing:
+        return True
+
+    console_.print()
+    console_.print(Align.center(Panel(
+        Text.assemble(
+            ("Primera corrida: falta descargar ", "grey74"),
+            (f"{len(missing)} modelo{'s' if len(missing) > 1 else ''}", f"bold {WARN}"),
+            (".\nSon varios gigas y queda en caché para siempre.", "grey74")),
+        box=box.ROUNDED, border_style=WARN, padding=(1, 3),
+        width=card_width(console_.width))))
+    console_.print()
+
+    for model in missing:
+        console_.print(Text.assemble(("  ↓  ", WARN), (model, "grey74")))
+        try:
+            from huggingface_hub import snapshot_download
+            snapshot_download(model)
+        except Exception as exc:  # noqa: BLE001 - se le muestra al usuario
+            console_.print(error_panel(model, f"No se pudo descargar:\n{exc}"))
+            return False
+    console_.print()
+    return True
+
+
+def _whisper_ready(model: str) -> bool:
+    cache = Path.home() / ".cache" / "huggingface" / "hub"
+    return any(cache.glob(f"models--mlx-community--whisper-{model}*"))
+
+
+def card_width(width: int) -> int:
+    """Ancho común de las tarjetas de la portada.
+
+    Compartirlo es lo que hace que la pantalla se lea como una composición y no
+    como dos cajas sueltas de tamaños distintos.
+    """
+    return max(56, min(width - 8, 74))
+
+
+def pipeline_card(vlm: str, reporter: str, whisper: str, width: int) -> Panel:
+    """Las cuatro etapas y con qué se hace cada una.
+
+    Muestra si cada pieza ya está en disco: enterarse de que faltan 32 GB por
+    descargar vale mucho más antes de arrancar que a los cinco minutos.
+    """
+    table = Table.grid(padding=(0, 2))
+    table.add_column(style="grey30", width=2)
+    table.add_column(width=22)
+    table.add_column(ratio=1)
+    table.add_column(justify="right", width=10)
+
+    def row(num: str, what: str, who: str, state: Text) -> None:
+        table.add_row(Text(num, style=C2), Text(what, style="grey74"),
+                      Text(who, style="grey50"), state)
+
+    def ready(ok: bool, size: float, missing: str) -> Text:
+        state = Text()
+        if ok:
+            state.append("✓ listo", style=OK)
+        else:
+            state.append(missing if not size else f"↓ {size:.0f} GB", style=WARN)
+        return state
+
+    ffmpeg_ok = shutil.which("ffmpeg") is not None
+    reader_ok, reader_size = _model_status(vlm)
+    writer_ok, writer_size = _model_status(reporter)
+
+    row("①", "detecta pantallas", "dhash 1024 bits · ffmpeg",
+        ready(ffmpeg_ok, 0, "✗ instala ffmpeg"))
+    row("②", "transcribe el audio", f"whisper {whisper}",
+        ready(_whisper_ready(whisper), 1.5, "↓ descarga"))
+    row("③", "lee cada pantalla", _short_model(vlm),
+        ready(reader_ok, reader_size or 16, "↓ descarga"))
+    row("④", "redacta el informe", _short_model(reporter),
+        ready(writer_ok, writer_size or 16, "↓ descarga"))
+
+    panel = Panel(table, box=box.ROUNDED, border_style="grey27", padding=(1, 2),
+                  width=width, title=Text(" el motor ", style="grey42"),
+                  title_align="left")
+    if not ffmpeg_ok:
+        # Sin ffmpeg no hay nada que hacer, y el error saldría recién al abrir
+        # el video: vale más decirlo en la portada.
+        panel.border_style = ERR
+    return panel
+
+
+def welcome(vlm: str, reporter: str, whisper: str, width: int) -> Group:
+    tagline = Text(justify="center")
+    tagline.append("convierte una grabación de pantalla en un informe", style="grey62")
+    tagline.append("   ·   ", style="grey27")
+    tagline.append("100% local", style=OK)
+
+    return Group(
+        Text(), Align.center(gradient(MOTIF)),
+        Align.center(gradient(wordmark().rstrip("\n"))),
+        tagline, Text(),
+        Align.center(pipeline_card(vlm, reporter, whisper, card_width(width))),
+        Text(),
+    )
+
+
+def dropzone(width: int) -> Group:
+    """La zona donde se suelta el archivo."""
+    invite = Text(justify="center")
+    invite.append("▶  ", style=C1)
+    invite.append("arrastra el video aquí y presiona Enter", style=f"bold {C1}")
+
+    hint = Text(justify="center")
+    hint.append(FORMATS, style="grey35")
+    hint.append("        ", style="grey27")
+    hint.append("salida en ", style="grey35")
+    hint.append("~/Downloads", style="grey46")
+
+    return Group(
+        Align.center(Panel(invite, box=box.ROUNDED, border_style=C2,
+                           padding=(1, 2), width=card_width(width))),
+        Text(), hint, Text())
 
 
 class View:
@@ -80,7 +270,35 @@ class View:
         self.state.stage_key = key
         self.state.stage = label
         self.state.detail = detail
+        self.state.stage_started = time.time()
         self.draw(force=True)
+
+    def work(self, fn):
+        """Ejecuta algo bloqueante sin que la vista se congele.
+
+        Cargar un modelo o transcribir el audio no devuelve el control hasta
+        terminar. Rich sigue repintando, pero siempre el mismo cuadro: la
+        animación existe y está quieta, que es peor que no tenerla, porque
+        justo en las esperas largas parece que el programa colgó. Se hace el
+        trabajo en un hilo y se anima desde aquí.
+        """
+        result: dict = {}
+
+        def run() -> None:
+            try:
+                result["value"] = fn()
+            except BaseException as exc:  # noqa: BLE001 - se relanza abajo
+                result["error"] = exc
+
+        thread = threading.Thread(target=run, daemon=True)
+        thread.start()
+        while thread.is_alive():
+            self.draw(force=True)
+            time.sleep(REDRAW_INTERVAL)
+        thread.join()
+        if "error" in result:
+            raise result["error"]
+        return result.get("value")
 
     def draw(self, force: bool = False) -> None:
         now = time.time()
@@ -201,7 +419,7 @@ def process(video: Path, args) -> bool:
         state.detail = f"{clock(duration)} de video"
         view.draw(force=True)
 
-        hashes = segment_mod.sample_hashes(video, args.fps)
+        hashes = view.work(lambda: segment_mod.sample_hashes(video, args.fps))
         raw_cuts = segment_mod.find_cuts(hashes, args.fps, args.threshold)
         cuts = segment_mod.absorb_transients(raw_cuts, duration, args.min_screen)
         state.detail = f"{len(cuts)} pantallas únicas de {len(hashes)} muestras"
@@ -214,7 +432,8 @@ def process(video: Path, args) -> bool:
         # 2 · audio
         state.active_model = f"whisper {args.whisper}"
         view.stage("oír", "transcribiendo el audio", f"whisper {args.whisper}")
-        transcript = audio_mod.transcribe(video, args.whisper, args.lang)
+        transcript = view.work(
+            lambda: audio_mod.transcribe(video, args.whisper, args.lang))
         if transcript.utterances:
             state.detail = (f"{len(transcript.utterances)} segmentos · "
                             f"idioma {transcript.language}")
@@ -228,10 +447,10 @@ def process(video: Path, args) -> bool:
         # 3 · extraer los frames elegidos
         state.active_model = ""
         view.stage("extraer", "extrayendo frames")
-        screens = segment_mod.extract_screens(
+        screens = view.work(lambda: segment_mod.extract_screens(
             video, cuts, duration, frames_dir,
             on_skip=lambda at, why: state.notes.append(
-                f"pantalla en {clock(at)} descartada, no se pudo extraer"))
+                f"pantalla en {clock(at)} descartada, no se pudo extraer")))
         if not screens:
             live.stop()
             console.print(error_panel(video.name, "No se pudo extraer ninguna pantalla."))
@@ -249,7 +468,7 @@ def process(video: Path, args) -> bool:
         view.stage("leer", "cargando el modelo lector",
                    state.reader_model + (f" · {size:.1f} GB" if size else ""))
         try:
-            model = VisionModel(args.vlm)
+            model = view.work(lambda: VisionModel(args.vlm))
         except ModelError as exc:
             live.stop()
             console.print(error_panel(video.name, str(exc)))
@@ -319,9 +538,9 @@ def process(video: Path, args) -> bool:
             state.active_model = state.writer_model
             view.stage("redactar", "cambiando al modelo de síntesis",
                        f"{state.reader_model} → {state.writer_model}")
-            model.release()
             try:
-                reporter = VisionModel(args.reporter)
+                reporter = view.work(lambda: (model.release(),
+                                              VisionModel(args.reporter))[1])
             except ModelError as exc:
                 state.notes.append(f"no se pudo cargar {args.reporter}: {exc}")
                 live.stop()
@@ -360,6 +579,12 @@ def process(video: Path, args) -> bool:
 
 
 def main() -> int:
+    # Las librerías de abajo emiten avisos por stderr en mitad de la corrida
+    # (mel filters de transformers, deprecaciones de torch). Bajo la vista de
+    # pantalla completa se escriben encima del panel y lo dejan ilegible, y no
+    # son accionables para quien usa la herramienta.
+    warnings.filterwarnings("ignore")
+
     parser = argparse.ArgumentParser(
         description="Analiza una grabación de pantalla cruzando imagen y audio, 100% local.")
     parser.add_argument("--version", action="version",
@@ -385,15 +610,15 @@ def main() -> int:
                         help="tope de pantallas a analizar (0 = sin tope)")
     args = parser.parse_args()
 
-    console.print(banner(args.vlm, args.reporter, args.whisper))
-
     files = args.files
     if not files:
-        console.print(Align.center(
-            Text("  ▶  arrastra el video aquí y presiona Enter  ", style=f"bold {C1}")))
-        console.print()
+        intro(console)
+    console.print(welcome(args.vlm, args.reporter, args.whisper, console.width))
+
+    if not files:
+        console.print(dropzone(console.width))
         try:
-            files = shlex.split(console.input("  ➜ "))
+            files = shlex.split(console.input("   ➜  "))
         except (EOFError, KeyboardInterrupt):
             console.print()
             return 1
@@ -402,6 +627,15 @@ def main() -> int:
     paths = [Path(os.path.expanduser(f)).resolve() for f in files if f.strip()]
     if not paths:
         console.print(error_panel("entrada", "No se indicó ningún video."))
+        return 1
+
+    if shutil.which("ffmpeg") is None:
+        console.print(error_panel(
+            "ffmpeg", "Falta ffmpeg, que es lo que decodifica el video.\n"
+                      "Instálalo con:  brew install ffmpeg"))
+        return 1
+
+    if not ensure_models([args.vlm, args.reporter], console):
         return 1
 
     ok = 0
