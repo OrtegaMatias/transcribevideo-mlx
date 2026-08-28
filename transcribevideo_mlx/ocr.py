@@ -79,9 +79,25 @@ def read_text(image: Path, min_confidence: float = MIN_CONFIDENCE) -> list[str]:
         if float(best.confidence()) < min_confidence:
             continue
         text = str(best.string()).strip()
-        if text:
+        if _is_text(text):
             lines.append(text)
     return lines
+
+
+def _is_text(line: str) -> bool:
+    """¿Esto es texto de la interfaz, o un icono que el OCR intentó leer?
+
+    Vision reporta toda región que se le parezca a escritura, y los iconos de
+    una interfaz salen como caracteres sueltos o pares raros: "G", "*", "••",
+    "|| O" —esos tres son los botones de navegación de Android—. Medido sobre
+    999 líneas de un video real, 143 eran de esta clase y ninguna aportaba nada.
+
+    El umbral es exigir dos caracteres alfanuméricos. Uno solo dejaba pasar los
+    iconos que casualmente contienen una letra; dos los descarta y conserva
+    igual las respuestas cortas legítimas de una interfaz: "Sí", "No", "OK",
+    "93%".
+    """
+    return sum(c.isalnum() for c in line) >= 2
 
 
 def read_screens(images: list[Path]) -> str:

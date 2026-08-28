@@ -57,3 +57,21 @@ def test_several_screens_are_labelled(tmp_path):
     texto = ocr.read_screens(paths)
     assert "--- pantalla 1 ---" in texto and "--- pantalla 2 ---" in texto
     assert "Primera" in texto and "Segunda" in texto
+
+
+def test_icons_read_as_letters_are_discarded():
+    """Vision intenta leer los iconos de la barra de estado.
+
+    Medido sobre un video real: de 999 líneas, 138 eran caracteres sueltos o
+    símbolos salidos de iconos, y ninguna aportaba nada.
+    """
+    from transcribevideo_mlx.ocr import _is_text
+    for basura in ["G", "*", "Q", "••", ":", ")", "|| O", ":::"]:
+        assert _is_text(basura) is False, basura
+
+
+def test_short_but_real_text_survives():
+    """Un filtro por longitud se llevaría respuestas legítimas de una interfaz."""
+    from transcribevideo_mlx.ocr import _is_text
+    for real in ["Sí", "No", "OK", "93%", "14:36", "1 aplicación"]:
+        assert _is_text(real) is True, real
