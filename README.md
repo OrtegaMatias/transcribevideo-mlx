@@ -115,6 +115,7 @@ transcribevideo a.mp4 b.mov              # several at once
 | `--fps` | Sampling rate for screen-change detection | `2.0` |
 | `--threshold` | dhash distance (of 1024) to call it a new screen | `50` |
 | `--min-screen` | Seconds a screen must persist to be analyzed; briefer stretches are folded into the previous one | `1.5` |
+| `--ocr` | Who transcribes the screen: `modelo` (the VLM) or `vision` (macOS's native OCR, with the model only interpreting) | `modelo` |
 | `--max-screens` | Cap on screens analyzed (0 = no cap) | `0` |
 
 ### While it runs
@@ -213,6 +214,38 @@ accompanies. So `elementos_ui` is capped at five items biased toward non-text
 controls, `motivo` at eight words, `sintesis` at one sentence, and only the
 genuinely duplicated field was removed: the per-screen narration summary, since
 the full transcript already reaches the report verbatim.
+
+### Letting macOS do the reading — measured, and kept optional
+
+Transcribing and interpreting are opposite tasks, and today the same model does
+both. Copying the pixels that are letters has one correct answer and admits no
+judgement; deciding what is happening is pure judgement. `--ocr vision` hands the
+first job to Vision, macOS's native OCR, and leaves the model only the second.
+The model **still receives the image** — it needs sight for what OCR cannot give:
+that a row is greyed out, that a toggle is off, that a control has no label.
+
+Measured over the same 5-minute recording, both arms end to end:
+
+| | model transcribes | Vision transcribes |
+|---|---|---|
+| total | 489 s | **368 s** (−25%) |
+| generated tokens | 15,517 | **10,232** (−34%) |
+| text lines captured | 569 | **999**, of which 143 were icon noise |
+| report facts recovered | 19 / 25 | 18 / 25 |
+
+So: meaningfully cheaper, materially more raw text, and a report of **equivalent**
+quality — not a better one. Worth being precise, because an early estimate of
+"12× faster" compared Vision's OCR time against the model's *entire* chunk, which
+includes interpreting. The honest figure for the reading loop is 1.37×.
+
+The unambiguous win is elsewhere. Until now, the same model heard the audio and
+wrote the screen text, so contamination between them was possible in principle —
+mitigated by the prompt and measured clean, but structurally possible. When the
+literal text comes from something that never heard the audio, that failure mode
+stops existing.
+
+It stays opt-in because the evidence is one video, and a phone recording at that —
+the worst case for OCR noise, with icons everywhere.
 
 ### Local OpenAI-compatible servers may not count image tokens
 
