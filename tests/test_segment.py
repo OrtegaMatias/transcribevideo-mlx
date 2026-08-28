@@ -131,5 +131,24 @@ def test_absorbing_never_loses_time():
     assert bounds[-1] == 50.0
 
 
+def test_a_screen_shown_briefly_but_deliberately_survives_the_default():
+    """Un menú o un paso de onboarding dura poco y aun así es contenido.
+
+    Auditadas contra el video, las pantallas legítimas que se estaban perdiendo
+    duraban 1.5s: el usuario las atraviesa rápido pero documentan un paso. El
+    ruido de animación vive por debajo del segundo.
+    """
+    from transcribevideo_mlx.segment import MIN_SCREEN_SECONDS
+
+    # Una pantalla que estuvo 1.5s se conserva: es un paso que alguien atravesó.
+    deliberada = [0.0, 10.0, 11.5, 30.0]
+    assert 10.0 in absorb_transients(deliberada, 45.0, MIN_SCREEN_SECONDS)
+
+    # Una ráfaga de fotogramas de 0.3s se funde en la anterior y solo queda el
+    # instante en que la pantalla se estabilizó.
+    animacion = [0.0, 10.0, 10.3, 10.6, 30.0]
+    assert absorb_transients(animacion, 45.0, MIN_SCREEN_SECONDS) == [0.0, 10.6, 30.0]
+
+
 def test_empty_cuts():
     assert absorb_transients([], 10.0, 2.0) == []

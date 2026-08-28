@@ -33,10 +33,17 @@ CUT_THRESHOLD = 50
 SETTLE_SECONDS = 1.0
 #: Cuánto debe permanecer una pantalla para valerle una llamada al modelo.
 #: No es un ajuste de rendimiento sino de criterio: nadie lee ni narra algo que
-#: estuvo medio segundo. En una grabación de teléfono con contenido animado, la
-#: duración mediana de "pantalla" medida fue de 0.5s y el 71% no llegaba a 2s —
-#: todas ellas fotogramas de animación, no pantallas.
-MIN_SCREEN_SECONDS = 2.0
+#: estuvo medio segundo.
+#:
+#: El valor sale de una medición, y de haberlo puesto mal primero. En una
+#: grabación real de teléfono, el ruido de animación vive **por debajo de un
+#: segundo** (78 de 154 tramos). Con el umbral en 2.0s se perdían además
+#: pantallas legítimas —un menú, un paso de onboarding, un diálogo— que el
+#: usuario atraviesa rápido: las cuatro que se auditaron duraban exactamente
+#: 1.5s. En un tutorial esas son justo las que documentan un paso. A 1.5s se
+#: recuperan y siguen descartándose las animaciones, por algo más de un minuto
+#: de proceso en un video de cinco.
+MIN_SCREEN_SECONDS = 1.5
 #: Ancho máximo del frame que se le manda al VLM. A 1280px una pantalla cuesta
 #: ~900 tokens visuales en Qwen3-VL; subirlo encarece cada llamada sin mejorar
 #: el OCR de una UI.

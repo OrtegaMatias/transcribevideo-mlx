@@ -114,7 +114,7 @@ transcribevideo a.mp4 b.mov              # several at once
 | `--lang` | Force a language code (`es`, `en`, …) | auto-detect |
 | `--fps` | Sampling rate for screen-change detection | `2.0` |
 | `--threshold` | dhash distance (of 1024) to call it a new screen | `50` |
-| `--min-screen` | Seconds a screen must persist to be analyzed; briefer stretches are folded into the previous one | `2.0` |
+| `--min-screen` | Seconds a screen must persist to be analyzed; briefer stretches are folded into the previous one | `1.5` |
 | `--max-screens` | Cap on screens analyzed (0 = no cap) | `0` |
 
 ### While it runs
@@ -161,8 +161,16 @@ is **folded into the preceding screen** rather than dropped, so the narration
 spoken over a transition still belongs somewhere and no time goes unaccounted for.
 Of a burst of rapid changes the surviving cut is the *last* one — the moment the
 screen settled — so the captured frame is settled content rather than a
-half-finished transition. At the 2 s default that recording goes from 154 screens
-to 45.
+half-finished transition. On that recording it takes 154 screens down to 65.
+
+Where to put the threshold was worth measuring, and the first guess was wrong. At
+2 s the run was faster still (45 screens) but it was also swallowing **real**
+screens — a menu, an onboarding step, a dialog — that a user taps through quickly.
+Audited against the video, every legitimate screen being lost had lasted exactly
+1.5 s, while the animation noise lives below one second (78 of the 154 stretches).
+In a tutorial, the screens someone passes through fast are often the ones that
+document a step, so the default sits at 1.5 s: it costs about a minute on a
+five-minute recording and keeps them.
 
 ### Two models, because the two stages want opposite things
 
