@@ -177,10 +177,12 @@ class _LineSink(io.TextIOBase):
         while "\n" in self.buffer:
             line, self.buffer = self.buffer.split("\n", 1)
             line = line.strip()
-            # La barra de tqdm sale por el mismo sitio y no es contenido.
-            if line and "%|" not in line and "frames/s" not in line:
-                match = _SEGMENT_RE.match(line)
-                self.on_line(match.group(1) if match else line)
+            # Solo los segmentos con marca de tiempo son habla. Lo demás que
+            # Whisper imprime son diagnósticos suyos —detección de idioma,
+            # barras de tqdm, avisos— y colarlos en la transcripción la
+            # ensucia con texto que nadie dijo.
+            if match := _SEGMENT_RE.match(line):
+                self.on_line(match.group(1))
         return len(chunk)
 
     def flush(self) -> None:

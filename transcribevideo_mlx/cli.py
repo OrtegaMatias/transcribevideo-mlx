@@ -529,6 +529,7 @@ def process(video: Path, args) -> Path | None:
         # "transcribiendo" mientras todavía carga es mentir sobre en qué se está
         # yendo el tiempo; la etiqueta cambia sola con el primer segmento.
         view.stage("oír", "cargando whisper", args.whisper)
+        view.event("loading", what="whisper", model=args.whisper, gb=0.0)
         state.free_stream = True
 
         def on_segment(line: str) -> None:
@@ -583,6 +584,7 @@ def process(video: Path, args) -> Path | None:
         state.active_model = state.reader_model
         view.stage("leer", "cargando el modelo lector",
                    state.reader_model + (f" · {size:.1f} GB" if size else ""))
+        view.event("loading", what="lector", model=state.reader_model, gb=round(size, 1))
         if aviso := check_headroom(args.vlm, size):
             if live: live.stop()
             console.print(error_panel("memoria insuficiente", aviso))
@@ -633,7 +635,7 @@ def process(video: Path, args) -> Path | None:
             if ahora - ultimo_delta[0] >= 0.25:
                 ultimo_delta[0] = ahora
                 view.event("reading", field=state.reader.field or "",
-                           text="\n".join(state.reader.lines(limit=12, width=90)))
+                           text="\n".join(state.reader.lines(limit=12, width=10_000)))
             # El título aparece primero en el JSON: en cuanto se lee, la fila
             # activa deja de decir "leyendo…" y muestra de qué pantalla se trata.
             if state.reader.field == "titulo" and state.rows:
@@ -703,6 +705,8 @@ def process(video: Path, args) -> Path | None:
             size = model_size_gb(args.reporter)
             view.stage("redactar", f"cargando {state.writer_model}",
                        f"{size:.1f} GB desde disco" if size else "desde disco")
+            view.event("loading", what="redactor", model=state.writer_model,
+                       gb=round(size, 1))
             # Llegar hasta aquí y perderlo todo sería el peor desenlace: leer
             # las pantallas es la parte cara y ya está hecha. Si el redactor no
             # cabe o no carga, la corrida sigue y entrega lo leído sin síntesis.
@@ -744,7 +748,7 @@ def process(video: Path, args) -> Path | None:
             if ahora - ultimo_informe[0] >= 0.3:
                 ultimo_informe[0] = ahora
                 view.event("writing", phase=state.reader.phase,
-                           text="\n".join(state.reader.tail(limit=14, width=90)))
+                           text="\n".join(state.reader.tail(limit=14, width=10_000)))
 
         if reporter is None:
             body = fallback_body(units, sin_sintesis)

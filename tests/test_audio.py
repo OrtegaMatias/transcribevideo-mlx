@@ -81,3 +81,33 @@ def test_between_assigns_each_utterance_to_exactly_one_window():
     assigned = [u for start, end in windows for u in tr.between(start, end)]
     assert len(assigned) == len(tr.utterances)
     assert len(set(id(u) for u in assigned)) == len(tr.utterances)
+
+
+# ── captura de la salida de Whisper ─────────────────────────────────────
+
+def test_only_speech_reaches_the_transcript():
+    """Whisper imprime diagnósticos suyos por el mismo sitio que el habla.
+
+    Se colaban en la transcripción cosas como "Detecting language using up to
+    the first 30 seconds", que nadie dijo. Solo las líneas con marca de tiempo
+    son habla.
+    """
+    from transcribevideo_mlx.audio import _LineSink
+    recogidas = []
+    sink = _LineSink(recogidas.append)
+    sink.write("Detecting language using up to the first 30 seconds.\n")
+    sink.write("Detected language: Spanish\n")
+    sink.write("[00:00.980 --> 00:04.380]  Bienvenidos a la capacitación.\n")
+    sink.write(" 39%|███▉      | 2544/6483 [00:00<00:00, 5461frames/s]\n")
+    sink.write("[00:04.680 --> 00:08.140]  Vamos a empezar.\n")
+    assert recogidas == ["Bienvenidos a la capacitación.", "Vamos a empezar."]
+
+
+def test_a_line_split_between_writes_is_not_lost():
+    """Una escritura puede caer a mitad de línea; se acumula hasta el salto."""
+    from transcribevideo_mlx.audio import _LineSink
+    recogidas = []
+    sink = _LineSink(recogidas.append)
+    sink.write("[00:01.000 --> 00:02.000]  media ")
+    sink.write("frase partida\n")
+    assert recogidas == ["media frase partida"]
