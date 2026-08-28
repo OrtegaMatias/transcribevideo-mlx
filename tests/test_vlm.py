@@ -1,6 +1,7 @@
 """Recorte del JSON y del bloque de razonamiento en la salida del modelo."""
 import pytest
 
+import transcribevideo_mlx.vlm as vlm_mod
 from transcribevideo_mlx.vlm import _extract_json, _strip_reasoning
 
 
@@ -85,3 +86,33 @@ def test_the_latest_closer_wins_across_families():
 
 def test_output_without_reasoning_is_untouched():
     assert _strip_reasoning("  respuesta directa  ") == "respuesta directa"
+
+
+# ── resguardo de memoria ────────────────────────────────────────────────
+
+def test_no_warning_when_there_is_room(monkeypatch):
+    monkeypatch.setattr(vlm_mod, "available_memory_gb", lambda: 40.0)
+    assert vlm_mod.check_headroom("org/modelo", 16.0) is None
+
+
+def test_warns_when_the_machine_would_choke(monkeypatch):
+    """Sin memoria, MLX no falla limpio: el sistema se congela.
+
+    Ocurrió de verdad: dos corridas en paralelo, ~21 GB de pico cada una, y la
+    máquina hubo que reiniciarla a la fuerza. Otra instancia aparece aquí como
+    memoria ya ocupada, así que esta comprobación cubre también ese caso.
+    """
+    monkeypatch.setattr(vlm_mod, "available_memory_gb", lambda: 12.0)
+    aviso = vlm_mod.check_headroom("org/gemma-4-26B", 16.0)
+    assert aviso is not None
+    assert "gemma-4-26B" in aviso and "12.0 GB" in aviso
+
+
+def test_a_model_of_unknown_size_is_not_blocked(monkeypatch):
+    """Si no se sabe cuánto pesa, no se puede afirmar que no cabe."""
+    monkeypatch.setattr(vlm_mod, "available_memory_gb", lambda: 1.0)
+    assert vlm_mod.check_headroom("org/modelo", 0.0) is None
+
+
+def test_available_memory_returns_a_positive_number():
+    assert vlm_mod.available_memory_gb() > 0

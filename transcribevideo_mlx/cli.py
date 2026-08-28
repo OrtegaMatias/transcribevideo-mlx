@@ -39,12 +39,18 @@ from .live import (C1, C2, DIM, ERR, OK, WARN, RunState, ScreenRow, clock,
                    compact, gradient, human, interp, render)
 from .report import render_json, render_markdown, unique_path, write_report
 from .segment import CUT_THRESHOLD, MIN_SCREEN_SECONDS, SAMPLE_FPS
-from .vlm import DEFAULT_MODEL, DEFAULT_REPORTER, Usage, resolve_model_path
+from .vlm import (DEFAULT_MODEL, DEFAULT_REPORTER, Usage, available_memory_gb,
+                  check_headroom, resolve_model_path)
 
 DOWNLOADS = Path.home() / "Downloads"
 #: Mínimo entre repintados. El modelo emite decenas de tokens por segundo y
 #: redibujar en cada uno gasta más CPU en la UI que en la inferencia.
-REDRAW_INTERVAL = 0.08
+#:
+#: 10 por segundo basta para que el spinner y el cursor se vean fluidos. Cada
+#: repintado escribe ~9 KB de pantalla completa y compite por el GIL con el
+#: hilo que está generando tokens, así que subirlo se paga en tirones, no en
+#: suavidad.
+REDRAW_INTERVAL = 0.1
 
 console = Console(file=sys.stdout, highlight=False)
 
@@ -210,6 +216,19 @@ def pipeline_card(vlm: str, reporter: str, whisper: str, width: int) -> Panel:
     row("④", "redacta el informe", _short_model(reporter),
         ready(writer_ok, writer_size or 16, "↓ descarga"))
 
+    # La memoria es la única de estas condiciones que cambia entre una corrida y
+    # la siguiente. Sin ella el sistema no da un error: se congela.
+    libre = available_memory_gb()
+    necesita = max(reader_size, writer_size) * 1.35 or 21.0
+    holgura = Text()
+    if libre >= necesita:
+        holgura.append(f"✓ {libre:.0f} GB libres", style=OK)
+    else:
+        holgura.append(f"⚠ solo {libre:.0f} GB", style=WARN)
+    table.add_row(Text("⑤", style=C2), Text("memoria", style="grey74"),
+                  Text(f"~{necesita:.0f} GB en uso", style="grey50"),
+                  holgura)
+
     panel = Panel(table, box=box.ROUNDED, border_style="grey27", padding=(1, 2),
                   width=width, title=Text(" el motor ", style="grey42"),
                   title_align="left")
@@ -307,7 +326,10 @@ class View:
             return
         self._last = now
         self.state.frame += 1
-        self.live.update(render(self.state, self.width, self.height))
+        # refresh explícito: con auto_refresh apagado, update() por sí solo no
+        # pinta nada.
+        self.live.update(render(self.state, self.width, self.height),
+                         refresh=True)
 
 
 def _short_model(name: str) -> str:
@@ -448,7 +470,13 @@ def process(video: Path, args) -> Path | None:
     full_screen = console.is_terminal
     height = console.size.height if full_screen else 30
 
-    with Live(console=console, refresh_per_second=20, screen=full_screen,
+    # `auto_refresh` apagado a propósito: con él, Rich levanta un hilo que
+    # repinta por su cuenta el MISMO contenido, y sumado a los repintados de
+    # `View.draw` daban ~32 pantallas completas por segundo —unos 290 KB/s al
+    # terminal— compitiendo por el GIL con el hilo que genera tokens. Ese exceso
+    # se veía como tirones, no como fluidez. Aquí pinta solo quien tiene algo
+    # nuevo que mostrar.
+    with Live(console=console, screen=full_screen, auto_refresh=False,
               transient=not full_screen) as live:
         view = View(live, state, console.width, height)
 
@@ -519,6 +547,11 @@ def process(video: Path, args) -> Path | None:
         state.active_model = state.reader_model
         view.stage("leer", "cargando el modelo lector",
                    state.reader_model + (f" · {size:.1f} GB" if size else ""))
+        if aviso := check_headroom(args.vlm, size):
+            live.stop()
+            console.print(error_panel("memoria insuficiente", aviso))
+            return None
+
         try:
             model = view.work(lambda: VisionModel(args.vlm))
         except ModelError as exc:
@@ -602,6 +635,11 @@ def process(video: Path, args) -> Path | None:
             size = model_size_gb(args.reporter)
             view.stage("redactar", f"cargando {state.writer_model}",
                        f"{size:.1f} GB desde disco" if size else "desde disco")
+            if aviso := check_headroom(args.reporter, size):
+                live.stop()
+                console.print(error_panel("memoria insuficiente", aviso))
+                return None
+
             try:
                 reporter = view.work(lambda: VisionModel(args.reporter))
             except ModelError as exc:

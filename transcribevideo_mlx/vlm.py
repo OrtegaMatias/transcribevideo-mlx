@@ -264,3 +264,49 @@ def _extract_json(text: str) -> dict:
                 except json.JSONDecodeError:
                     return json.loads(_repair_escapes(candidate))
     raise ValueError("objeto JSON incompleto")
+
+
+def available_memory_gb() -> float:
+    """Memoria realmente disponible ahora mismo, en GB.
+
+    Se suman las páginas libres y las inactivas: macOS puede reclamar las
+    inactivas sin ir a disco, así que son memoria utilizable de verdad, no
+    ocupada.
+    """
+    import subprocess
+    try:
+        out = subprocess.run(["vm_stat"], capture_output=True, text=True).stdout
+    except Exception:  # noqa: BLE001 - sin vm_stat no se puede afirmar nada
+        return float("inf")
+
+    page = 16384
+    pages = 0
+    for line in out.splitlines():
+        if "page size of" in line:
+            page = int(line.split("page size of")[1].split()[0])
+        elif line.startswith(("Pages free:", "Pages inactive:", "Pages speculative:")):
+            pages += int(line.split(":")[1].strip().rstrip("."))
+    return pages * page / 1e9
+
+
+def check_headroom(model: str, needed_gb: float) -> str | None:
+    """Avisa si cargar este modelo dejaría la máquina sin memoria.
+
+    Un modelo de dieciséis gigas en una máquina que no los tiene no da un error
+    limpio: el sistema entero se arrastra hasta congelarse y hay que reiniciar a
+    la fuerza. Y como otra corrida en paralelo aparece aquí como memoria ya
+    ocupada, esta sola comprobación cubre también el caso de dos instancias
+    peleándose por la RAM.
+    """
+    if not needed_gb:
+        return None
+    free = available_memory_gb()
+    # Margen sobre el peso del modelo: caché de KV, activaciones y el resto del
+    # proceso. Medido, una corrida con un modelo de 15.6 GB llega a 21 GB.
+    if free < needed_gb * 1.35:
+        return (f"Quedan {free:.1f} GB disponibles y {model.split('/')[-1]} "
+                f"necesita cerca de {needed_gb * 1.35:.0f} GB.\n"
+                "Cierra aplicaciones —u otra corrida de transcribevideo— antes "
+                "de seguir: si el sistema se queda sin memoria no falla, se "
+                "congela.")
+    return None

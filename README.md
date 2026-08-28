@@ -262,3 +262,11 @@ which genuinely is synthesis, keeps reasoning on.
 ## License
 
 [MIT](LICENSE) © Matias Ortega Carrasco
+
+### Memory
+
+The run holds one model at a time, about 21 GB at peak. When memory runs out MLX
+does not fail cleanly — the whole machine slows to a crawl and needs a hard
+restart. So the welcome screen reports free memory before starting, and the run
+refuses to load a model that would not fit. Note this also catches the case of a
+**second copy already running**: its memory shows up here as unavailable.
