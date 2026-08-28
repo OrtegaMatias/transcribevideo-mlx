@@ -301,23 +301,41 @@ def total_memory_gb() -> float:
 
 
 def other_instances() -> int:
-    """Cuántas otras corridas de esta herramienta hay vivas.
+    """Cuántas OTRAS corridas de esta herramienta hay vivas.
 
     Es el riesgo real, y el que se materializó: dos procesos pidiendo 21 GB cada
     uno en una máquina de 48 dejaron el sistema colgado. La memoria libre del
-    momento no lo detecta a tiempo —cada proceso la reserva de a poco— pero
-    contar procesos sí.
+    momento no lo anticipa —cada proceso la toma de a poco— pero contar
+    procesos sí.
+
+    Lo delicado es no contarse a uno mismo. Basta con excluir el propio PID:
+    el entorno virtual se llama `transcribevideo-mlx`, así que cualquier proceso
+    hijo —el `resource_tracker` de multiprocessing, por ejemplo— lleva ese
+    nombre en la ruta de su intérprete y aparece en la búsqueda. Y cuando la
+    corrida la lanza la aplicación de escritorio, el padre también se llama
+    igual. Por eso se compara el **grupo de procesos**: todo lo que esta corrida
+    creó, y quien la creó, comparten grupo; otra corrida tiene el suyo.
     """
     import os
     import subprocess
     try:
         out = subprocess.run(["pgrep", "-f", "transcribevideo"],
                              capture_output=True, text=True).stdout
+        propio_grupo = os.getpgrp()
     except Exception:  # noqa: BLE001
         return 0
-    propios = {os.getpid(), os.getppid()}
-    return sum(1 for pid in out.split()
-               if pid.isdigit() and int(pid) not in propios)
+
+    ajenas = 0
+    for token in out.split():
+        if not token.isdigit():
+            continue
+        pid = int(token)
+        try:
+            if os.getpgid(pid) != propio_grupo:
+                ajenas += 1
+        except (ProcessLookupError, PermissionError):
+            continue
+    return ajenas
 
 
 #: Memoria que se le deja al sistema operativo y al resto de aplicaciones.

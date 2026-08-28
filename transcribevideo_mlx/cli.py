@@ -536,6 +536,10 @@ def process(video: Path, args) -> Path | None:
                 state.stage = "transcribiendo el audio"
                 state.detail = args.whisper
             state.reader.feed(line + "\n")
+            # También hacia afuera: durante la transcripción el motor no tiene
+            # pantallas que reportar todavía, y sin esto cualquier interfaz que
+            # lo consuma se queda medio minuto sin nada que mostrar.
+            view.event("transcript_line", text=line)
 
         transcript = view.work(lambda: audio_mod.transcribe(
             video, args.whisper, args.lang, on_segment=on_segment))
