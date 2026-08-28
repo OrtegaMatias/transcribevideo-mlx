@@ -421,30 +421,40 @@ def context_tokens(units, transcript) -> int:
 
 
 def run_summary(state: RunState, whisper: str, duration: float, raw_cuts: int,
-                cuts: int, transcript, units, usage: Usage) -> list:
-    """Las cifras de la corrida, para la columna izquierda durante el informe."""
-    merges = sum(1 for u in units if u.merged)
-    errors = sum(1 for u in units if u.error)
-    per_screen = (sum(state.unit_times) / len(state.unit_times)
-                  if state.unit_times else 0.0)
-    words = len(transcript.full_text.split())
-    return [
-        ("video", [("duración", clock(duration)),
-                   ("pantallas", f"{raw_cuts} → {cuts}"),
-                   ("fundidas", raw_cuts - cuts)]),
-        ("audio", [("idioma", transcript.language),
-                   ("segmentos", len(transcript.utterances)),
-                   ("palabras", f"{words:,}".replace(",", "."))]),
-        ("lectura", [("unidades", len(units)),
-                     ("fusiones", merges),
-                     ("errores", errors),
-                     ("por pantalla", f"{per_screen:.1f} s"),
-                     ("tokens", f"{compact(usage.prompt_tokens)} / "
-                                f"{compact(usage.generation_tokens)}")]),
-        ("modelos", [("lee", state.reader_model),
-                     ("redacta", state.writer_model),
-                     ("oye", whisper)]),
-    ]
+                cuts: int, transcript=None, units=None, usage: Usage | None = None
+                ) -> list:
+    """Las cifras de la corrida, para la columna izquierda.
+
+    Tolera que falte casi todo: se llama apenas termina la segmentación, cuando
+    aún no hay audio ni unidades, y se vuelve a llamar a medida que hay más que
+    contar. Un panel que se va llenando dice más que uno vacío hasta el final.
+    """
+    secciones = [("video", [("duración", clock(duration)),
+                            ("pantallas", f"{raw_cuts} → {cuts}"),
+                            ("fundidas", raw_cuts - cuts)])]
+    if transcript is not None:
+        words = len(transcript.full_text.split())
+        secciones.append(
+            ("audio", [("idioma", transcript.language),
+                       ("segmentos", len(transcript.utterances)),
+                       ("palabras", f"{words:,}".replace(",", "."))]))
+    if units:
+        merges = sum(1 for u in units if u.merged)
+        errors = sum(1 for u in units if u.error)
+        per_screen = (sum(state.unit_times) / len(state.unit_times)
+                      if state.unit_times else 0.0)
+        secciones.append(
+            ("lectura", [("unidades", len(units)),
+                         ("fusiones", merges),
+                         ("errores", errors),
+                         ("por pantalla", f"{per_screen:.1f} s"),
+                         ("tokens", f"{compact(usage.prompt_tokens)} / "
+                                    f"{compact(usage.generation_tokens)}"
+                                    if usage else "—")]))
+    secciones.append(("modelos", [("lee", state.reader_model),
+                                  ("redacta", state.writer_model),
+                                  ("oye", whisper)]))
+    return secciones
 
 
 def process(video: Path, args) -> Path | None:
@@ -494,6 +504,8 @@ def process(video: Path, args) -> Path | None:
             state.notes.append(
                 f"{len(raw_cuts) - len(cuts)} tramos de menos de {args.min_screen:g}s "
                 "fundidos en la pantalla anterior (animaciones)")
+        state.summary = run_summary(state, args.whisper, duration,
+                                    len(raw_cuts), len(cuts))
         view.draw(force=True)
 
         # 2 · audio
@@ -522,6 +534,8 @@ def process(video: Path, args) -> Path | None:
             state.notes.append("el video no trae audio; el informe sale solo de las pantallas")
         view.draw(force=True)
 
+        state.summary = run_summary(state, args.whisper, duration, len(raw_cuts),
+                                    len(cuts), transcript)
         cuts = snap_to_speech(cuts, transcript, duration=duration)
 
         # 3 · extraer los frames elegidos
@@ -590,7 +604,10 @@ def process(video: Path, args) -> Path | None:
                 if lines:
                     state.rows[state.active].title = lines[0]
 
+        units_so_far: list = []
+
         def on_unit(unit) -> None:
+            units_so_far.append(unit)
             state.record_unit(unit.usage.seconds)
             start = state.active
             for offset, _screen in enumerate(unit.screens):
@@ -605,6 +622,9 @@ def process(video: Path, args) -> Path | None:
             state.generation_tokens = total_usage.generation_tokens
             state.peak_memory = total_usage.peak_memory
             state.record_tps(unit.usage.tps)
+            state.summary = run_summary(state, args.whisper, duration,
+                                        len(raw_cuts), len(cuts), transcript,
+                                        units_so_far, total_usage)
             if unit.error:
                 state.notes.append(f"{clock(unit.start)} sin analizar: {unit.error[:60]}")
             state.reader.reset()

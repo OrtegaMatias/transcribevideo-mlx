@@ -385,8 +385,17 @@ def _header(state: RunState) -> Panel:
     top.add_column(ratio=1)
     top.add_column(justify="right")
     top.add_row(title, right)
-    return Panel(Group(top, Text(), breadcrumb(state)), box=box.ROUNDED,
-                 border_style="grey27", padding=(0, 2))
+
+    # `state.stage` dice qué se está haciendo AHORA ("cargando whisper"), que no
+    # es lo mismo que la etapa del recorrido ("oír"). Al pasar a pantalla
+    # completa se dejó de dibujar y el usuario veía la onda sin saber por qué.
+    ahora = Text(justify="center")
+    ahora.append(SPIN[state.frame % len(SPIN)] + "  ", style=C1)
+    ahora.append(state.stage or "…", style="grey78")
+    if state.detail:
+        ahora.append(f"   ·   {state.detail}", style=DIM)
+    return Panel(Group(top, Text(), breadcrumb(state), Text(), ahora),
+                 box=box.ROUNDED, border_style="grey27", padding=(0, 2))
 
 
 def _summary(state: RunState, width: int) -> Panel:
@@ -486,7 +495,9 @@ def _stream(state: RunState, width: int, rows_visible: int) -> Panel:
                      "grey82")
     elif not state.rows:
         waiting = Text(justify="center")
-        waiting.append(state.detail or "trabajando", style="grey62")
+        waiting.append(state.stage or "trabajando", style="grey74")
+        if state.detail:
+            waiting.append(f"  {state.detail}", style="grey50")
         waiting.append("   ", style="grey27")
         waiting.append(human(state.stage_elapsed), style="grey35")
         rows += [Text(), Align.center(pulse(state.frame, min(inner, 46))),
@@ -547,7 +558,7 @@ def _footer(state: RunState, width: int) -> Panel:
 def render(state: RunState, width: int, height: int = 30) -> Layout:
     """Compone la vista completa."""
     footer_height = 5 if state.notes else 4
-    body_height = max(6, height - 6 - footer_height)
+    body_height = max(6, height - 8 - footer_height)
     rows_visible = max(3, body_height - 4)
 
     left = max(24, int(width * 0.36))
@@ -555,7 +566,7 @@ def render(state: RunState, width: int, height: int = 30) -> Layout:
 
     layout = Layout()
     layout.split_column(
-        Layout(_header(state), name="head", size=5),
+        Layout(_header(state), name="head", size=7),
         Layout(name="body", ratio=1),
         Layout(_footer(state, width), name="foot", size=footer_height),
     )
